@@ -2,3 +2,4 @@ models/
 out/
 *.mp4
 *.mov
+__pycache__/
