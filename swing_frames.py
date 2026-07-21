@@ -166,42 +166,50 @@ def crossing(ys, start, end, level, direction):
 
 
 def detect_events(ys: np.ndarray, speeds: np.ndarray, fps: float) -> dict:
-    """Map the 8 swing positions to frame indices using wrist height + speed."""
+    """Map the 8 swing positions to frame indices using wrist height + speed.
+
+    Anchors are chosen so the transition pause at the top of the backswing
+    (near-zero hand speed) can't be confused with address stillness: top is
+    the highest wrist point before peak hand speed, and address is the last
+    frame before the top where the hands sit near their low baseline.
+    """
     n = len(ys)
     peak = int(np.argmax(speeds))          # near impact: fastest hand speed
     still = 0.05 * speeds[peak]
     hold = max(2, int(fps * 0.1))
 
-    # Backswing start: first sustained motion before the speed peak
-    moving = speeds > still
-    start = 0
-    for i in range(peak, 0, -1):
-        if not moving[max(0, i - hold):i].any():
-            start = i
-            break
-    address = max(0, start - 1)
-
-    top = start + int(np.argmin(ys[start:peak + 1]))
-    address_y, top_y = ys[address], ys[top]
-    rng = address_y - top_y  # positive: top is higher on screen
-    if rng < 1e-6:
+    top = int(np.argmin(ys[:peak + 1]))
+    base_y = float(np.max(ys[:top + 1])) if top > 0 else float(ys[0])
+    top_y = ys[top]
+    rng = base_y - top_y  # positive: top is higher on screen
+    if top == 0 or rng < 20:
         sys.exit("No backswing motion detected. Is the clip trimmed to one swing?")
 
-    toe_up = crossing(ys, address, top, address_y - 0.30 * rng, "up")
-    mid_back = crossing(ys, address, top, address_y - 0.70 * rng, "up")
+    addr = [i for i in range(top) if ys[i] >= base_y - 0.05 * rng]
+    address = addr[-1] if addr else 0
 
-    impact = crossing(ys, top, n, address_y - 0.05 * rng, "down")
+    toe_up = crossing(ys, address, top, base_y - 0.30 * rng, "up")
+    mid_back = crossing(ys, address, top, base_y - 0.70 * rng, "up")
+
+    # Impact: hands' first local bottom after the top, at least halfway back
+    # down. (At 30fps the true impact instant can fall between frames.)
+    impact = None
+    for i in range(top + 2, n - 1):
+        if ys[i] >= ys[i - 1] and ys[i] >= ys[i + 1] and ys[i] >= base_y - 0.5 * rng:
+            impact = i
+            break
     if impact is None:
         impact = min(peak + 1, n - 1)
-    mid_down = crossing(ys, top, impact, address_y - 0.50 * rng, "down")
+    mid_down = crossing(ys, top, impact, base_y - 0.50 * rng, "down")
 
-    # Follow-through: hands rise again after impact
-    post = impact + max(1, int(fps * 0.02))
-    mid_follow = crossing(ys, post, n, address_y - 0.50 * rng, "up")
+    # Follow-through and finish: search only a bounded window after impact so
+    # untrimmed footage (slo-mo replays, camera cuts) can't be grabbed
+    horizon = min(n, impact + int(fps * 2.5))
+    mid_follow = crossing(ys, impact + 1, horizon, base_y - 0.50 * rng, "up")
 
-    finish = n - 1
+    finish = horizon - 1
     calm = speeds < 1.5 * still
-    for i in range(min(impact + int(fps * 0.3), n - hold), n - hold):
+    for i in range(min(impact + int(fps * 0.3), horizon - hold), horizon - hold):
         if calm[i:i + hold].all():
             finish = i
             break

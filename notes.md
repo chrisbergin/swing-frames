@@ -8,9 +8,9 @@ Prototype for the golf swing app idea (see `context/ideas.md`): upload a swing v
 
 `swing_frames.py` runs MediaPipe Pose (Tasks API, `PoseLandmarker`) over every frame, tracks the wrist midpoint, and detects events from wrist height plus hand speed:
 
-- address: last still frame before sustained motion
 - top: highest wrist point before peak hand speed
-- impact: wrists return to address height after the top
+- address: last frame before the top where hands sit near their low baseline (anchoring on the top avoids mistaking the transition pause for address stillness)
+- impact: hands' first local bottom after the top
 - toe_up / mid_backswing / mid_downswing / mid_follow_through: fractional height crossings between address and top
 - finish: motion settles after impact
 
@@ -37,7 +37,9 @@ Requirements: Python 3.13 system install, `pip install mediapipe opencv-python n
 ## Status / Next Steps
 
 - 2026-07-21: script scaffolded, dependencies installed, pipeline verified end to end on a synthetic clip (pose detection correctly reports no human found). Not yet run on a real swing video.
-- [ ] Record 3-4 slo-mo swings (down-the-line) and run extraction; judge frame quality
+- 2026-07-21: first real video (IMG_5146.MOV, down-the-line, driver, 27fps): first run failed because the transition pause at the top read as address stillness; reworked event anchors (top first, then address and impact relative to it). All 8 extracted frames look correct on visual inspection. Regular-speed video works, but impact lands on the nearest frame; slo-mo still preferred for a true impact frame.
+- 2026-07-21: first pro comparison (Grant Horvat driver, down-the-line). The raw YouTube clip is a 33s edit with a slo-mo replay, and post-impact events drifted into the replay. Fixed by bounding post-impact search to 2.5s after impact, and by trimming the clip to the first swing (first 100 frames, saved as horvat_driver_trimmed.mp4). Comparison sheet aligns well. Lesson: pro clips must be trimmed to a single continuous swing from one camera, same rule as own videos.
+- [ ] Record more swings (slo-mo, face-on too) and confirm the heuristics hold up
 - [ ] Grab a pro swing video at the same angle and test --compare
 - [ ] If heuristics are shaky: tune crossing fractions, or evaluate SwingNet
 - [ ] If extraction is good: decide on phase 2 web app
