@@ -251,14 +251,32 @@ def label(img, text, height=36):
     return np.vstack([bar, img])
 
 
-def contact_sheet(frames_by_event, tile_h=360):
-    tiles = []
+def tile_resize(img, tile_h=360):
+    scale = tile_h / img.shape[0]
+    return cv2.resize(img, (int(img.shape[1] * scale), tile_h))
+
+
+def pad_to_width(img, width):
+    left = (width - img.shape[1]) // 2
+    right = width - img.shape[1] - left
+    return cv2.copyMakeBorder(img, 0, 0, left, right,
+                              cv2.BORDER_CONSTANT, value=(0, 0, 0))
+
+
+def contact_sheet(tiles):
+    return cv2.hconcat([label(tiles[n], n.replace("_", " ")) for n in EVENTS])
+
+
+def comparison_sheet(tiles_a, tiles_b):
+    """One column per position: both videos' tiles padded to a shared width
+    so every position lines up regardless of the videos' aspect ratios."""
+    cols = []
     for name in EVENTS:
-        img = frames_by_event[name]
-        scale = tile_h / img.shape[0]
-        img = cv2.resize(img, (int(img.shape[1] * scale), tile_h))
-        tiles.append(label(img, name.replace("_", " ")))
-    return cv2.hconcat(tiles)
+        a, b = tiles_a[name], tiles_b[name]
+        w = max(a.shape[1], b.shape[1])
+        col = cv2.vconcat([pad_to_width(a, w), pad_to_width(b, w)])
+        cols.append(label(col, name.replace("_", " ")))
+    return cv2.hconcat(cols)
 
 
 def process(video_path: Path, model_path: Path, outdir: Path, rotate: int, overlay: bool):
@@ -269,15 +287,14 @@ def process(video_path: Path, model_path: Path, outdir: Path, rotate: int, overl
     events = detect_events(ys, speeds, fps)
 
     outdir.mkdir(parents=True, exist_ok=True)
-    frames_by_event = {}
+    tiles = {}
     for i, name in enumerate(EVENTS, 1):
         f = events[name]
         img = draw_pose(frames[f], landmarks[f]) if overlay else frames[f]
-        frames_by_event[name] = img
+        tiles[name] = tile_resize(img)
         cv2.imwrite(str(outdir / f"{i:02d}_{name}.png"), img)
 
-    sheet = contact_sheet(frames_by_event)
-    cv2.imwrite(str(outdir / "contact_sheet.png"), sheet)
+    cv2.imwrite(str(outdir / "contact_sheet.png"), contact_sheet(tiles))
     with open(outdir / "events.json", "w") as fh:
         json.dump({
             "video": str(video_path), "fps": fps, "n_frames": len(frames),
@@ -287,7 +304,7 @@ def process(video_path: Path, model_path: Path, outdir: Path, rotate: int, overl
 
     print(f"  Events: " + ", ".join(f"{k}={v}" for k, v in events.items()))
     print(f"  Wrote {outdir}\\contact_sheet.png")
-    return sheet
+    return tiles
 
 
 def main():
@@ -307,14 +324,11 @@ def main():
     root = args.outdir or (Path(__file__).parent / "out")
     overlay = not args.no_overlay
 
-    sheet = process(args.video, model_path, root / args.video.stem, args.rotate, overlay)
+    tiles = process(args.video, model_path, root / args.video.stem, args.rotate, overlay)
     if args.compare:
-        pro_sheet = process(args.compare, model_path, root / args.compare.stem,
+        pro_tiles = process(args.compare, model_path, root / args.compare.stem,
                             args.rotate, overlay)
-        w = max(sheet.shape[1], pro_sheet.shape[1])
-        pad = lambda s: cv2.copyMakeBorder(s, 0, 0, 0, w - s.shape[1],
-                                           cv2.BORDER_CONSTANT, value=(0, 0, 0))
-        combo = cv2.vconcat([pad(sheet), pad(pro_sheet)])
+        combo = comparison_sheet(tiles, pro_tiles)
         combo_path = root / f"comparison_{args.video.stem}_vs_{args.compare.stem}.png"
         cv2.imwrite(str(combo_path), combo)
         print(f"\nSide-by-side comparison: {combo_path}")
