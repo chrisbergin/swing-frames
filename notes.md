@@ -6,13 +6,12 @@ Prototype for the golf swing app idea (see `context/ideas.md`): upload a swing v
 
 ## How It Works
 
-`swing_frames.py` runs MediaPipe Pose (Tasks API, `PoseLandmarker`) over every frame, tracks the wrist midpoint, and detects events from wrist height plus hand speed:
+`swing_frames.py` runs MediaPipe Pose (Tasks API, `PoseLandmarker`) over every frame, tracks the wrist midpoint, and detects events from wrist height alone. Hand speed is deliberately not used: it is zero on freeze frames and spikes at cuts in pause-and-step analysis videos, which broke two earlier speed-based versions. Structure: hands go high twice per swing (backswing top, finish hold).
 
-- top: highest wrist point before peak hand speed
-- address: last frame before the top where hands sit near their low baseline (anchoring on the top avoids mistaking the transition pause for address stillness)
-- impact: hands' first local bottom after the top
-- toe_up / mid_backswing / mid_downswing / mid_follow_through: fractional height crossings between address and top
-- finish: motion settles after impact
+- find the two hands-high episodes: top = highest wrists in the first, finish = highest wrists in the last
+- impact: hands at their lowest between the top and the finish episode
+- address: last frame before the top with hands near their baseline (97th percentile of wrist height)
+- toe_up / mid_backswing / mid_downswing / mid_follow_through: fractional height crossings between those anchors
 
 No club tracking (body keypoints only) and no ML training. If heuristics prove too brittle, the fallback is SwingNet trained on GolfDB (McNally et al. 2019, code and weights on GitHub, MobileNetV2 so CPU is fine).
 
@@ -39,6 +38,7 @@ Requirements: Python 3.13 system install, `pip install mediapipe opencv-python n
 - 2026-07-21: script scaffolded, dependencies installed, pipeline verified end to end on a synthetic clip (pose detection correctly reports no human found). Not yet run on a real swing video.
 - 2026-07-21: first real video (IMG_5146.MOV, down-the-line, driver, 27fps): first run failed because the transition pause at the top read as address stillness; reworked event anchors (top first, then address and impact relative to it). All 8 extracted frames look correct on visual inspection. Regular-speed video works, but impact lands on the nearest frame; slo-mo still preferred for a true impact frame.
 - 2026-07-21: first pro comparison (Grant Horvat driver, down-the-line). The raw YouTube clip is a 33s edit with a slo-mo replay, and post-impact events drifted into the replay. Fixed by bounding post-impact search to 2.5s after impact, and by trimming the clip to the first swing (first 100 frames, saved as horvat_driver_trimmed.mp4). Comparison sheet aligns well. Lesson: pro clips must be trimmed to a single continuous swing from one camera, same rule as own videos.
+- 2026-07-21: second pro clip (Grant-Horvat-Driver2.mp4) is a pause-and-step analysis video: freeze frames with near-zero motion connected by jumps. Speed-based anchors collapsed (impact/follow/finish all landed on one plateau). Rewrote detection to be purely position-based (two hands-high episodes). All 8 positions now correct on both continuous and step-frame footage; three video types verified (own phone video, trimmed continuous pro clip, step-frame pro clip).
 - [ ] Record more swings (slo-mo, face-on too) and confirm the heuristics hold up
 - [ ] Grab a pro swing video at the same angle and test --compare
 - [ ] If heuristics are shaky: tune crossing fractions, or evaluate SwingNet

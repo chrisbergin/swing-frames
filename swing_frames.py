@@ -166,53 +166,55 @@ def crossing(ys, start, end, level, direction):
 
 
 def detect_events(ys: np.ndarray, speeds: np.ndarray, fps: float) -> dict:
-    """Map the 8 swing positions to frame indices using wrist height + speed.
+    """Map the 8 swing positions to frame indices from wrist height alone.
 
-    Anchors are chosen so the transition pause at the top of the backswing
-    (near-zero hand speed) can't be confused with address stillness: top is
-    the highest wrist point before peak hand speed, and address is the last
-    frame before the top where the hands sit near their low baseline.
+    Purely position-based (hand speed is never used) so it works on
+    continuous footage, slo-mo, and pause-and-step analysis videos alike,
+    where speed is zero on freeze frames and spikes at cuts. Structure: the
+    hands go high twice (backswing top, then finish hold). Find those two
+    episodes, then anchor everything else around and between them.
     """
     n = len(ys)
-    peak = int(np.argmax(speeds))          # near impact: fastest hand speed
-    still = 0.05 * speeds[peak]
-    hold = max(2, int(fps * 0.1))
-
-    top = int(np.argmin(ys[:peak + 1]))
-    base_y = float(np.max(ys[:top + 1])) if top > 0 else float(ys[0])
-    top_y = ys[top]
-    rng = base_y - top_y  # positive: top is higher on screen
-    if top == 0 or rng < 20:
+    baseline = float(np.percentile(ys, 97))  # hands-down (address) height
+    rng = baseline - float(np.min(ys))       # positive: high hands = small y
+    if rng < 20:
         sys.exit("No backswing motion detected. Is the clip trimmed to one swing?")
 
-    addr = [i for i in range(top) if ys[i] >= base_y - 0.05 * rng]
+    up = ys < baseline - 0.6 * rng
+    episodes, start = [], None
+    for i, flag in enumerate(up):
+        if flag and start is None:
+            start = i
+        elif not flag and start is not None:
+            episodes.append((start, i))
+            start = None
+    if start is not None:
+        episodes.append((start, n))
+    episodes = [(a, b) for a, b in episodes if b - a >= 3]  # drop noise blips
+    if not episodes:
+        sys.exit("No backswing motion detected. Is the clip trimmed to one swing?")
+
+    e1a, e1b = episodes[0]
+    top = e1a + int(np.argmin(ys[e1a:e1b]))
+
+    if len(episodes) > 1:
+        e2a, e2b = episodes[-1]
+        finish = e2a + int(np.argmin(ys[e2a:e2b]))
+        impact_zone_end = e2a
+    else:
+        # Clip ends before a distinct finish hold (e.g. cut right after impact)
+        finish = n - 1
+        impact_zone_end = n
+    # Impact: hands at their lowest between the top and the finish episode
+    impact = top + int(np.argmax(ys[top:impact_zone_end]))
+
+    addr = [i for i in range(top) if ys[i] >= baseline - 0.05 * rng]
     address = addr[-1] if addr else 0
 
-    toe_up = crossing(ys, address, top, base_y - 0.30 * rng, "up")
-    mid_back = crossing(ys, address, top, base_y - 0.70 * rng, "up")
-
-    # Impact: hands' first local bottom after the top, at least halfway back
-    # down. (At 30fps the true impact instant can fall between frames.)
-    impact = None
-    for i in range(top + 2, n - 1):
-        if ys[i] >= ys[i - 1] and ys[i] >= ys[i + 1] and ys[i] >= base_y - 0.5 * rng:
-            impact = i
-            break
-    if impact is None:
-        impact = min(peak + 1, n - 1)
-    mid_down = crossing(ys, top, impact, base_y - 0.50 * rng, "down")
-
-    # Follow-through and finish: search only a bounded window after impact so
-    # untrimmed footage (slo-mo replays, camera cuts) can't be grabbed
-    horizon = min(n, impact + int(fps * 2.5))
-    mid_follow = crossing(ys, impact + 1, horizon, base_y - 0.50 * rng, "up")
-
-    finish = horizon - 1
-    calm = speeds < 1.5 * still
-    for i in range(min(impact + int(fps * 0.3), horizon - hold), horizon - hold):
-        if calm[i:i + hold].all():
-            finish = i
-            break
+    toe_up = crossing(ys, address, top, baseline - 0.30 * rng, "up")
+    mid_back = crossing(ys, address, top, baseline - 0.70 * rng, "up")
+    mid_down = crossing(ys, top, impact, baseline - 0.50 * rng, "down")
+    mid_follow = crossing(ys, impact + 1, finish + 1, baseline - 0.50 * rng, "up")
 
     events = {
         "address": address, "toe_up": toe_up, "mid_backswing": mid_back,
