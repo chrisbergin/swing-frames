@@ -127,7 +127,7 @@ def smooth(x: np.ndarray, window: int) -> np.ndarray:
 
 
 def wrist_track(landmarks, n_frames: int, fps: float):
-    """Wrist-midpoint trajectory with gaps interpolated. Returns (ys, speeds)."""
+    """Wrist-midpoint trajectory with gaps interpolated. Returns (xs, ys)."""
     ys = np.full(n_frames, np.nan)
     xs = np.full(n_frames, np.nan)
     for i, pts in enumerate(landmarks):
@@ -146,9 +146,7 @@ def wrist_track(landmarks, n_frames: int, fps: float):
     xs = np.interp(idx, idx[valid], xs[valid])
     win = max(3, int(fps / 15))
     ys, xs = smooth(ys, win), smooth(xs, win)
-    speeds = np.hypot(np.gradient(xs), np.gradient(ys))
-    speeds = smooth(speeds, win)
-    return ys, speeds
+    return xs, ys
 
 
 def crossing(ys, start, end, level, direction):
@@ -165,8 +163,8 @@ def crossing(ys, start, end, level, direction):
     return None
 
 
-def detect_events(ys: np.ndarray, speeds: np.ndarray, fps: float) -> dict:
-    """Map the 8 swing positions to frame indices from wrist height alone.
+def detect_events(xs: np.ndarray, ys: np.ndarray, fps: float) -> dict:
+    """Map the 8 swing positions to frame indices from wrist position alone.
 
     Purely position-based (hand speed is never used) so it works on
     continuous footage, slo-mo, and pause-and-step analysis videos alike,
@@ -205,16 +203,23 @@ def detect_events(ys: np.ndarray, speeds: np.ndarray, fps: float) -> dict:
         # Clip ends before a distinct finish hold (e.g. cut right after impact)
         finish = n - 1
         impact_zone_end = n
-    # Impact: hands at their lowest between the top and the finish episode
-    impact = top + int(np.argmax(ys[top:impact_zone_end]))
-
+    # Address: if the clip starts with the hands already set (recommended
+    # trimming), the first frame is the cleanest address. Otherwise take the
+    # last near-baseline frame, backed off by the smoothing window so the
+    # takeaway boundary (smeared by smoothing at hard cuts) is not picked.
     addr = [i for i in range(top) if ys[i] >= baseline - 0.05 * rng]
-    # The last near-baseline frame sits on the takeaway boundary (smoothing
-    # smears hard cuts in step-frame videos, so that frame can already show
-    # the club in the air). Back off by the smoothing window to land safely
-    # inside the address hold.
     win = max(3, int(fps / 15))
-    address = max(addr[-1] - win, addr[0]) if addr else 0
+    if not addr or addr[0] == 0:
+        address = 0
+    else:
+        address = max(addr[-1] - win, addr[0])
+
+    # Impact: hands at their lowest between the top and the finish episode.
+    # Known limit: at regular framerates the pose tracker lags the blurred
+    # hands through the hitting zone, so this lands 1-2 frames after the
+    # strike (~70ms at 27fps). Wrist data cannot see the club; slo-mo
+    # footage avoids the blur and lands on the true impact frame.
+    impact = top + int(np.argmax(ys[top:impact_zone_end]))
 
     toe_up = crossing(ys, address, top, baseline - 0.30 * rng, "up")
     mid_back = crossing(ys, address, top, baseline - 0.70 * rng, "up")
@@ -288,8 +293,8 @@ def process(video_path: Path, model_path: Path, outdir: Path, rotate: int, overl
     print(f"\nProcessing {video_path.name}...")
     frames, landmarks, fps = track_video(video_path, model_path, rotate)
     print(f"  {len(frames)} frames at {fps:.1f} fps")
-    ys, speeds = wrist_track(landmarks, len(frames), fps)
-    events = detect_events(ys, speeds, fps)
+    xs, ys = wrist_track(landmarks, len(frames), fps)
+    events = detect_events(xs, ys, fps)
 
     outdir.mkdir(parents=True, exist_ok=True)
     tiles = {}
