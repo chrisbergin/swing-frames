@@ -273,6 +273,54 @@ def refine_impact(frames, model_path, lo, hi, fallback):
     return max(i for i, y in measured if y >= bottom - eps)
 
 
+def joint_angles(pts):
+    """2D angles in degrees at the major joints, plus spine tilt from
+    vertical. Angles are size- and distance-invariant, so two bodies at the
+    same camera angle can be compared directly."""
+    def ang(a, b, c):
+        v1 = np.array(pts[a]) - np.array(pts[b])
+        v2 = np.array(pts[c]) - np.array(pts[b])
+        cos = np.dot(v1, v2) / (np.linalg.norm(v1) * np.linalg.norm(v2) + 1e-9)
+        return float(np.degrees(np.arccos(np.clip(cos, -1.0, 1.0))))
+
+    angles = {
+        "l_elbow": ang(11, 13, 15), "r_elbow": ang(12, 14, 16),
+        "l_shoulder": ang(13, 11, 23), "r_shoulder": ang(14, 12, 24),
+        "l_hip": ang(11, 23, 25), "r_hip": ang(12, 24, 26),
+        "l_knee": ang(23, 25, 27), "r_knee": ang(24, 26, 28),
+    }
+    sh = (np.array(pts[11]) + np.array(pts[12])) / 2
+    hp = (np.array(pts[23]) + np.array(pts[24])) / 2
+    v = sh - hp
+    angles["spine_tilt"] = float(np.degrees(np.arctan2(v[0], -v[1])))
+    return angles
+
+
+def compare_swings(marks_a, events_a, marks_b, events_b):
+    """Joint-angle similarity at each matched position.
+
+    Per position: mean absolute angle difference across the 9 measured
+    angles, mapped to a 0-100 score (100 = identical, 2 points lost per
+    degree of average difference). Only meaningful when both videos are
+    shot from the same camera angle and the golfers share handedness.
+    """
+    result = {}
+    for name in EVENTS:
+        pa, pb = marks_a[events_a[name]], marks_b[events_b[name]]
+        if pa is None or pb is None:
+            result[name] = None
+            continue
+        aa, ab = joint_angles(pa), joint_angles(pb)
+        diffs = {k: abs(aa[k] - ab[k]) for k in aa}
+        mean_diff = sum(diffs.values()) / len(diffs)
+        result[name] = {
+            "score": round(max(0.0, 100 - 2 * mean_diff), 1),
+            "mean_angle_diff_deg": round(mean_diff, 1),
+            "joint_diffs_deg": {k: round(v, 1) for k, v in diffs.items()},
+        }
+    return result
+
+
 def draw_pose(frame, pts):
     out = frame.copy()
     if pts is None:
@@ -288,8 +336,12 @@ def draw_pose(frame, pts):
 def label(img, text, height=36):
     h, w = img.shape[:2]
     bar = np.zeros((height, w, 3), dtype=np.uint8)
+    scale = 0.7
+    while scale > 0.4 and cv2.getTextSize(
+            text, cv2.FONT_HERSHEY_SIMPLEX, scale, 2)[0][0] > w - 12:
+        scale -= 0.05
     cv2.putText(bar, text, (8, height - 12), cv2.FONT_HERSHEY_SIMPLEX,
-                0.7, (255, 255, 255), 2, cv2.LINE_AA)
+                scale, (255, 255, 255), 2, cv2.LINE_AA)
     return np.vstack([bar, img])
 
 
@@ -309,15 +361,19 @@ def contact_sheet(tiles):
     return cv2.hconcat([label(tiles[n], n.replace("_", " ")) for n in EVENTS])
 
 
-def comparison_sheet(tiles_a, tiles_b):
+def comparison_sheet(tiles_a, tiles_b, similarity=None):
     """One column per position: both videos' tiles padded to a shared width
-    so every position lines up regardless of the videos' aspect ratios."""
+    so every position lines up regardless of the videos' aspect ratios.
+    With similarity, each column label gets its 0-100 score appended."""
     cols = []
     for name in EVENTS:
         a, b = tiles_a[name], tiles_b[name]
         w = max(a.shape[1], b.shape[1])
         col = cv2.vconcat([pad_to_width(a, w), pad_to_width(b, w)])
-        cols.append(label(col, name.replace("_", " ")))
+        text = name.replace("_", " ")
+        if similarity and similarity.get(name):
+            text += f"  {similarity[name]['score']:.0f}"
+        cols.append(label(col, text))
     return cv2.hconcat(cols)
 
 
@@ -353,7 +409,7 @@ def process(video_path: Path, model_path: Path, outdir: Path, rotate: int, overl
 
     print(f"  Events: " + ", ".join(f"{k}={v}" for k, v in events.items()))
     print(f"  Wrote {outdir}\\contact_sheet.png")
-    return tiles
+    return tiles, landmarks, events
 
 
 def main():
@@ -373,12 +429,35 @@ def main():
     root = args.outdir or (Path(__file__).parent / "out")
     overlay = not args.no_overlay
 
-    tiles = process(args.video, model_path, root / args.video.stem, args.rotate, overlay)
+    tiles, marks, events = process(args.video, model_path, root / args.video.stem,
+                                   args.rotate, overlay)
     if args.compare:
-        pro_tiles = process(args.compare, model_path, root / args.compare.stem,
-                            args.rotate, overlay)
-        combo = comparison_sheet(tiles, pro_tiles)
-        combo_path = root / f"comparison_{args.video.stem}_vs_{args.compare.stem}.png"
+        pro_tiles, pro_marks, pro_events = process(
+            args.compare, model_path, root / args.compare.stem, args.rotate, overlay)
+
+        similarity = compare_swings(marks, events, pro_marks, pro_events)
+        scored = {k: v for k, v in similarity.items() if v}
+        overall = round(sum(v["score"] for v in scored.values()) / len(scored), 1) \
+            if scored else None
+
+        print("\nSimilarity by position (100 = identical joint angles):")
+        for name in EVENTS:
+            v = similarity[name]
+            if v is None:
+                print(f"  {name:20s}   n/a (no pose at this frame)")
+                continue
+            gaps = sorted(v["joint_diffs_deg"].items(), key=lambda kv: -kv[1])[:2]
+            gap_txt = ", ".join(f"{k} {d:.0f}" for k, d in gaps)
+            print(f"  {name:20s} {v['score']:5.1f}   biggest gaps (deg): {gap_txt}")
+        print(f"  {'overall':20s} {overall}")
+
+        stem = f"{args.video.stem}_vs_{args.compare.stem}"
+        with open(root / f"similarity_{stem}.json", "w") as fh:
+            json.dump({"video": str(args.video), "compare": str(args.compare),
+                       "overall_score": overall, "positions": similarity}, fh, indent=2)
+
+        combo = comparison_sheet(tiles, pro_tiles, similarity)
+        combo_path = root / f"comparison_{stem}.png"
         cv2.imwrite(str(combo_path), combo)
         print(f"\nSide-by-side comparison: {combo_path}")
 

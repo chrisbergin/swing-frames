@@ -34,6 +34,7 @@ Deliberate constraints: body keypoints only (the club and ball are never tracked
    - any crossing that is not found falls back to the midpoint of its neighbors
 5. **Refine impact**: the tracked hands-lowest frame can be one frame off the true strike, because a driver contacts the teed ball just after the hands' low point and neighboring frames measure within noise of each other. A second, small pose pass (IMAGE mode, each frame detected independently) re-measures a bounded window around the candidate and takes the last frame within 5% of the lowest hands.
 6. **Output**: for each event, write a PNG with the skeleton overlaid, plus `contact_sheet.png` (all 8 side by side), `events.json` (frame numbers and timestamps), and in `--compare` mode a two-row comparison image with both videos aligned column by column per position.
+7. **Similarity scoring** (`--compare` mode): at each matched position, both poses are reduced to 9 joint angles (both elbows, shoulders, hips, knees, plus spine tilt from vertical). Angles are size- and distance-invariant, so the two bodies compare directly. Per position: mean absolute angle difference mapped to a 0-100 score (2 points lost per degree of average difference). Output: a console table with each position's score and its two biggest joint gaps, an overall score (mean across positions), `similarity_*.json` with every angle difference, and the score stamped on each comparison sheet column. Caveats: both videos must be shot from the same camera angle and both golfers must share handedness, and a low score can mean a technique difference or an event-timing difference (the extracted frames sitting at slightly different moments of the swing).
 
 Why position-based instead of speed-based: hand speed is zero on freeze frames and spikes at cuts, so speed-based detection broke on pause-and-step analysis videos (the kind golf YouTubers post). Wrist position works on continuous footage, slo-mo, and step-frame edits alike. Two earlier speed-based versions were scrapped over this.
 
@@ -49,6 +50,7 @@ Single file, ~370 lines, top to bottom:
 - `crossing()`: helper that finds where the track crosses a given height level in a given direction
 - `detect_events()`: the heuristic core described above; maps the 8 positions to frame indices using only `xs`/`ys`
 - `refine_impact()`: the bounded IMAGE-mode second pass for the impact frame
+- `joint_angles()`, `compare_swings()`: reduce a pose to 9 joint angles and score two swings' similarity per position
 - `draw_pose()`, `label()`, `tile_resize()`, `pad_to_width()`: drawing and layout helpers
 - `contact_sheet()`, `comparison_sheet()`: assemble the multi-position output images
 - `process()`: per-video pipeline (track, detect, refine, write outputs)
