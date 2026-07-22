@@ -209,7 +209,12 @@ def detect_events(ys: np.ndarray, speeds: np.ndarray, fps: float) -> dict:
     impact = top + int(np.argmax(ys[top:impact_zone_end]))
 
     addr = [i for i in range(top) if ys[i] >= baseline - 0.05 * rng]
-    address = addr[-1] if addr else 0
+    # The last near-baseline frame sits on the takeaway boundary (smoothing
+    # smears hard cuts in step-frame videos, so that frame can already show
+    # the club in the air). Back off by the smoothing window to land safely
+    # inside the address hold.
+    win = max(3, int(fps / 15))
+    address = max(addr[-1] - win, addr[0]) if addr else 0
 
     toe_up = crossing(ys, address, top, baseline - 0.30 * rng, "up")
     mid_back = crossing(ys, address, top, baseline - 0.70 * rng, "up")
