@@ -215,10 +215,9 @@ def detect_events(xs: np.ndarray, ys: np.ndarray, fps: float) -> dict:
         address = max(addr[-1] - win, addr[0])
 
     # Impact: hands at their lowest between the top and the finish episode.
-    # Known limit: at regular framerates the pose tracker lags the blurred
-    # hands through the hitting zone, so this lands 1-2 frames after the
-    # strike (~70ms at 27fps). Wrist data cannot see the club; slo-mo
-    # footage avoids the blur and lands on the true impact frame.
+    # At regular framerates this lands 1-2 frames after the strike (VIDEO
+    # mode's temporal prior lags the motion-blurred hands through the
+    # hitting zone); refine_impact() re-measures the window afterwards.
     impact = top + int(np.argmax(ys[top:impact_zone_end]))
 
     toe_up = crossing(ys, address, top, baseline - 0.30 * rng, "up")
@@ -239,6 +238,39 @@ def detect_events(xs: np.ndarray, ys: np.ndarray, fps: float) -> dict:
             nxt = next((order[j] for j in range(i + 1, len(order)) if order[j] is not None), n - 1)
             order[i] = (prev + nxt) // 2
     return dict(zip(EVENTS, order))
+
+
+def refine_impact(frames, model_path, lo, hi, fallback):
+    """Re-measure wrist height over [lo, hi) with IMAGE-mode pose and return
+    the hands-lowest frame.
+
+    IMAGE mode detects each frame independently, so unlike the VIDEO-mode
+    track it does not lag the motion-blurred hands through the hitting zone.
+    Too slow to run on every frame; only worth it on this small window.
+    """
+    options = vision.PoseLandmarkerOptions(
+        base_options=mp_tasks.BaseOptions(model_asset_path=str(model_path)),
+        running_mode=vision.RunningMode.IMAGE,
+    )
+    measured = []
+    with vision.PoseLandmarker.create_from_options(options) as landmarker:
+        for i in range(lo, hi):
+            h = frames[i].shape[0]
+            rgb = cv2.cvtColor(frames[i], cv2.COLOR_BGR2RGB)
+            result = landmarker.detect(
+                mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb))
+            if result.pose_landmarks:
+                pts = result.pose_landmarks[0]
+                y = (pts[L_WRIST].y + pts[R_WRIST].y) / 2 * h
+                measured.append((i, y))
+    if not measured:
+        return fallback
+    # Ball contact comes just after the hands' lowest point (teed ball, hit
+    # on the upswing), and consecutive frames near the bottom measure within
+    # noise of each other: take the last frame within a hair of the lowest.
+    bottom = max(y for _, y in measured)
+    eps = 0.05 * (bottom - min(y for _, y in measured))
+    return max(i for i, y in measured if y >= bottom - eps)
 
 
 def draw_pose(frame, pts):
@@ -295,6 +327,13 @@ def process(video_path: Path, model_path: Path, outdir: Path, rotate: int, overl
     print(f"  {len(frames)} frames at {fps:.1f} fps")
     xs, ys = wrist_track(landmarks, len(frames), fps)
     events = detect_events(xs, ys, fps)
+
+    # Second look at impact with lag-free per-frame detection, searching
+    # mostly backwards since the tracked impact is only ever late
+    win = max(3, int(fps / 15))
+    lo = max(events["top"], events["impact"] - 2 * win)
+    hi = min(len(frames), events["impact"] + win + 1)
+    events["impact"] = refine_impact(frames, model_path, lo, hi, events["impact"])
 
     outdir.mkdir(parents=True, exist_ok=True)
     tiles = {}
