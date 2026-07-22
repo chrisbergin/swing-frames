@@ -1,5 +1,7 @@
 # Golf Swing Sequencer
 
+Technical explainer (packages, requirements, detection logic, code map): `how_it_works.md`.
+
 ## What This Is
 
 Prototype for the golf swing app idea (see `context/ideas.md`): upload a swing video, auto-extract frames at the 8 key swing positions, and optionally compare side by side against a pro's swing. Phase 1 is this local Python prototype. If the frame extraction proves useful on real videos, phase 2 is a client-side web app (React + MediaPipe WASM, free static hosting, video never leaves the browser), reusing the karaoke app stack.
