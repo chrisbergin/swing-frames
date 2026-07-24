@@ -20,22 +20,6 @@ Recording guidance:
 - Down-the-line or face-on both work, but compare like angle with like angle
 - Pro clips from YouTube must be trimmed to one continuous swing from one camera
 
-## Technology
-
-- **MediaPipe Pose (PoseLandmarker, Tasks API)**: Google's pretrained human pose model. Given an image, it returns 33 body keypoints (shoulders, elbows, wrists, hips, knees, ankles, plus face and hand points) as x/y coordinates. This is the only "AI" in the system: pretrained, runs locally on CPU, no training and no cloud calls.
-- **OpenCV (cv2)**: video decoding, image drawing, resizing, and writing the output PNGs.
-- **NumPy**: the trajectory math (smoothing, percentiles, argmax/argmin over the wrist track).
-
-Deliberate constraints: body keypoints only (the club and ball are never tracked), and no learned event model. All 8 positions are found with geometric heuristics on one signal: where the wrists are. If the heuristics ever prove too brittle, the documented fallback is SwingNet (McNally et al. 2019), an ML model trained specifically to label swing events.
-
-## System Requirements
-
-- Python 3.13
-- `pip install -r requirements.txt` (mediapipe, opencv-python, numpy; mediapipe 0.10.35 verified)
-- ~9 MB pose model, auto-downloaded to `models/` on first run (one-time, needs internet)
-- CPU is fine, no GPU needed. A 5-second clip processes in well under a minute; long clips scale linearly with frame count.
-- Input: any video OpenCV can read (iPhone .MOV and .mp4 both verified). Trim the clip to a single swing. Slo-mo strongly recommended for a crisp impact frame.
-
 ## How It Works, Step by Step
 
 1. **Track**: run MediaPipe Pose over every frame (VIDEO mode, which uses the previous frame as a prior for speed and stability). Keep the wrist midpoint, the average of the left and right wrist positions, as one (x, y) point per frame.
@@ -51,6 +35,22 @@ Deliberate constraints: body keypoints only (the club and ball are never tracked
 7. **Similarity scoring** (`--compare` mode): at each matched position, both poses are reduced to 9 joint angles (both elbows, shoulders, hips, knees, plus spine tilt from vertical). Angles are size- and distance-invariant, so the two bodies compare directly. Per position: mean absolute angle difference mapped to a 0-100 score (2 points lost per degree of average difference). Output: a console table with each position's score and its two biggest joint gaps, an overall score (mean across positions), `similarity_*.json` with every angle difference, and the score stamped on each comparison sheet column. Caveats: both videos must be shot from the same camera angle and both golfers must share handedness, and a low score can mean a technique difference or an event-timing difference (the extracted frames sitting at slightly different moments of the swing).
 
 Why position-based instead of speed-based: hand speed is zero on freeze frames and spikes at cuts, so speed-based detection broke on pause-and-step analysis videos (the kind golf YouTubers post). Wrist position works on continuous footage, slo-mo, and step-frame edits alike. Two earlier speed-based versions were scrapped over this.
+
+## Technology
+
+- **MediaPipe Pose (PoseLandmarker, Tasks API)**: Google's pretrained human pose model. Given an image, it returns 33 body keypoints (shoulders, elbows, wrists, hips, knees, ankles, plus face and hand points) as x/y coordinates. This is the only "AI" in the system: pretrained, runs locally on CPU, no training and no cloud calls.
+- **OpenCV (cv2)**: video decoding, image drawing, resizing, and writing the output PNGs.
+- **NumPy**: the trajectory math (smoothing, percentiles, argmax/argmin over the wrist track).
+
+Deliberate constraints: body keypoints only (the club and ball are never tracked), and no learned event model. All 8 positions are found with geometric heuristics on one signal: where the wrists are. If the heuristics ever prove too brittle, the documented fallback is SwingNet (McNally et al. 2019), an ML model trained specifically to label swing events.
+
+## System Requirements
+
+- Python 3.13
+- `pip install -r requirements.txt` (mediapipe, opencv-python, numpy; mediapipe 0.10.35 verified)
+- ~9 MB pose model, auto-downloaded to `models/` on first run (one-time, needs internet)
+- CPU is fine, no GPU needed. A 5-second clip processes in well under a minute; long clips scale linearly with frame count.
+- Input: any video OpenCV can read (iPhone .MOV and .mp4 both verified). Trim the clip to a single swing. Slo-mo strongly recommended for a crisp impact frame.
 
 ## Code Map (`swing_frames.py`)
 
