@@ -1,10 +1,24 @@
-# How the Golf Swing Sequencer Works
+# swing-frames
 
-Companion doc to `notes.md` (decision history and status). This explains the technology, the detection logic, and the code in `swing_frames.py`.
+Takes a video of a single golf swing and automatically extracts a still frame for each of the 8 canonical swing positions: address, toe up, mid backswing, top, mid downswing, impact, mid follow through, finish. Optionally lines up two videos (yours vs a pro) position by position in one comparison image, and scores how similar the two swings are at each position.
 
-## What It Does
+## Usage
 
-Takes a video of a single golf swing and automatically extracts a still frame for each of the 8 canonical swing positions: address, toe up, mid backswing, top, mid downswing, impact, mid follow through, finish. Optionally lines up two videos (yours vs a pro) position by position in one comparison image.
+```
+pip install -r requirements.txt
+python swing_frames.py my_swing.mp4
+python swing_frames.py my_swing.mp4 --compare pro_swing.mp4
+```
+
+Options: `--model lite|full|heavy` (default full), `--rotate 90|180|270` for sideways videos, `--no-overlay` to skip the skeleton, `--outdir`. Outputs land in `out/<video name>/`: 8 labeled PNGs, `contact_sheet.png`, `events.json`, and in compare mode `comparison_*.png` plus `similarity_*.json`.
+
+Recording guidance:
+
+- Trim the clip to a single swing (walking around or practice swings before the swing will confuse the detection)
+- Golfer fully in frame the whole swing
+- Slo-mo (iPhone 240fps) strongly recommended, otherwise impact may land between frames
+- Down-the-line or face-on both work, but compare like angle with like angle
+- Pro clips from YouTube must be trimmed to one continuous swing from one camera
 
 ## Technology
 
@@ -16,8 +30,8 @@ Deliberate constraints: body keypoints only (the club and ball are never tracked
 
 ## System Requirements
 
-- Python 3.13 (system install; no venv currently used)
-- `pip install mediapipe opencv-python numpy` (mediapipe 0.10.35 at time of writing)
+- Python 3.13
+- `pip install -r requirements.txt` (mediapipe, opencv-python, numpy; mediapipe 0.10.35 verified)
 - ~9 MB pose model, auto-downloaded to `models/` on first run (one-time, needs internet)
 - CPU is fine, no GPU needed. A 5-second clip processes in well under a minute; long clips scale linearly with frame count.
 - Input: any video OpenCV can read (iPhone .MOV and .mp4 both verified). Trim the clip to a single swing. Slo-mo strongly recommended for a crisp impact frame.
