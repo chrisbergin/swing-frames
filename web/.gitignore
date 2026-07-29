@@ -12,6 +12,9 @@ dist
 dist-ssr
 *.local
 
+# Copied out of node_modules by scripts/copy_mediapipe_assets.mjs
+public/mediapipe
+
 # Editor directories and files
 .vscode/*
 !.vscode/extensions.json
