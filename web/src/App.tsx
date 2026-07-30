@@ -181,6 +181,9 @@ function Diagnostics({
     <li>
       <strong>{text}:</strong> {analysis.frameCount} frames at{" "}
       {analysis.fps.toFixed(1)} fps, {analysis.width}&times;{analysis.height}
+      {analysis.playbackRate < 1 && (
+        <>, decoded at {Math.round(analysis.playbackRate * 100)}% speed</>
+      )}
       {analysis.droppedFrames > 0 && (
         <span className="warn">, {analysis.droppedFrames} dropped</span>
       )}
@@ -209,12 +212,17 @@ export default function App() {
       const analyse = (file: File, name: string) =>
         analyzeSwing(file, {
           model,
-          onProgress: ({ phase, done, total }) => {
+          onProgress: ({ phase, done, total, playbackRate }) => {
             const scope = total ? `${done}/${total}` : `${done}`;
+            // Tell them why it got slow, rather than looking stalled.
+            const slowed =
+              playbackRate < 1
+                ? ` · slowed to ${Math.round(playbackRate * 100)}% so no frames are missed`
+                : "";
             setStatus(
               phase === "tracking"
-                ? `Tracking ${name}: ${scope} frames`
-                : `Extracting ${name}: ${scope} frames`,
+                ? `Tracking ${name}: ${scope} frames${slowed}`
+                : `Extracting ${name}: ${scope} frames${slowed}`,
             );
           },
         });

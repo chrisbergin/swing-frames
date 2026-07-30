@@ -128,11 +128,22 @@ export async function loadVideo(
   video.src = url;
   video.muted = true;
   video.playsInline = true;
+  // iOS needs the attribute as well as the property to keep playback inline.
+  video.setAttribute("playsinline", "");
+  video.setAttribute("webkit-playsinline", "");
   video.preload = "auto";
   // Decoding into a canvas taints it unless the source is same-origin; a blob
   // URL is, but being explicit avoids a surprise if this ever moves to a URL.
   video.crossOrigin = "anonymous";
 
+  // Deliberately NOT attached to the document. Attaching it was tried, on the
+  // theory that iOS Safari needs the element in the page to present frames
+  // reliably, and every variant was worse on desktop: sized down with CSS the
+  // browser dropped to a lower decode resolution and moved the detected impact
+  // frame by two; placed behind the page or clipped to a small window it
+  // stopped being composited and playback died after a single frame. Detached
+  // decodes every frame at full resolution here. Revisit only with real
+  // numbers off an actual iOS device.
   const release = () => {
     video.removeAttribute("src");
     video.load();

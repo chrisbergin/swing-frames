@@ -1,5 +1,10 @@
 import { describe, it, expect } from "vitest";
-import { dropRate, framesToRetain, MAX_DROP_RATE } from "./pipeline";
+import {
+  dropRate,
+  framesToRetain,
+  MAX_DROP_RATE,
+  retryPlaybackRate,
+} from "./pipeline";
 import { EVENTS, type EventFrames } from "./core/constants";
 
 const events: EventFrames = {
@@ -52,5 +57,31 @@ describe("dropRate", () => {
 
   it("tolerates the occasional lost frame, which the track interpolates", () => {
     expect(dropRate(200, 2)).toBeLessThan(MAX_DROP_RATE);
+  });
+});
+
+describe("retryPlaybackRate", () => {
+  it("slows enough that a frame's work fits in a frame interval", () => {
+    // 30fps is a frame every 33ms; 100ms of work per frame needs roughly a
+    // quarter speed to fit with headroom to spare.
+    const rate = retryPlaybackRate(100, 30, 1);
+    expect(rate).toBeCloseTo((1000 / 30) * 0.7 / 100, 6);
+    expect(1000 / 30 / rate).toBeGreaterThan(100);
+  });
+
+  it("always ends up slower than the attempt that just failed", () => {
+    // Cheap frames that still dropped: something other than raw speed is
+    // wrong, so back off anyway rather than retrying at the same rate.
+    expect(retryPlaybackRate(1, 30, 1)).toBeLessThan(1);
+    expect(retryPlaybackRate(1, 30, 0.5)).toBeLessThan(0.5);
+  });
+
+  it("refuses to slow past the point of being worth waiting for", () => {
+    expect(retryPlaybackRate(100000, 240, 1)).toBe(0.05);
+  });
+
+  it("survives a degenerate first attempt", () => {
+    expect(retryPlaybackRate(0, 30, 1)).toBe(0.05);
+    expect(retryPlaybackRate(50, 0, 1)).toBe(0.05);
   });
 });
