@@ -124,12 +124,76 @@ button:disabled {
   opacity: 0.7;
 }
 
-.position {
-  padding: 14px 0;
+/* All 8 positions at a glance, the way the Python's contact sheet reads. */
+.sheet {
+  display: grid;
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+  gap: 6px;
+  margin-bottom: 18px;
+}
+
+@media (min-width: 720px) {
+  .sheet {
+    grid-template-columns: repeat(8, minmax(0, 1fr));
+  }
+}
+
+.cell {
+  display: flex;
+  flex-direction: column;
+  gap: 5px;
+  /* Override the primary-button styling. */
+  background: none;
+  color: inherit;
+  font: inherit;
+  text-align: left;
+  padding: 5px;
+  border: 1px solid transparent;
+  border-radius: 8px;
+  min-width: 0;
+}
+
+.cell:hover {
+  background: var(--panel);
+}
+
+.cell.is-selected {
+  border-color: var(--accent);
+  background: var(--panel);
+}
+
+.cell-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 4px;
+  min-height: 1.9em;
+}
+
+.cell-name {
+  font-size: 0.62rem;
+  line-height: 1.15;
+  text-transform: capitalize;
+  opacity: 0.85;
+  overflow-wrap: anywhere;
+}
+
+.cell-frames {
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+}
+
+.cell canvas {
+  border-radius: 4px;
+}
+
+.detail {
+  padding-top: 14px;
   border-top: 1px solid var(--border);
 }
 
-.position-head {
+.detail-head {
   display: flex;
   align-items: center;
   justify-content: space-between;
@@ -137,9 +201,15 @@ button:disabled {
   margin-bottom: 10px;
 }
 
-.position-head h3 {
-  font-size: 1rem;
+.detail-head h2 {
+  font-size: 1.1rem;
   text-transform: capitalize;
+}
+
+/* Cap the height so a portrait clip does not push everything off screen. */
+.detail .tile canvas {
+  max-height: 58vh;
+  object-fit: contain;
 }
 
 .score {
@@ -149,6 +219,12 @@ button:disabled {
   border-radius: 999px;
   border: 1px solid currentColor;
   font-size: 0.85rem;
+  white-space: nowrap;
+}
+
+.score-small {
+  font-size: 0.68rem;
+  padding: 0 5px;
 }
 
 .score-good {

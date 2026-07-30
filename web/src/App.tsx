@@ -28,6 +28,8 @@ const MODEL_LABELS: Record<ModelName, string> = {
   heavy: "Heavy (slowest)",
 };
 
+const label = (name: EventName) => name.replace(/_/g, " ");
+
 /** One extracted frame with its skeleton drawn on. */
 function FrameTile({
   tile,
@@ -38,7 +40,7 @@ function FrameTile({
   tile: HTMLCanvasElement | null;
   pose: Pose | null;
   scale: number;
-  caption: string;
+  caption?: string;
 }) {
   const ref = useRef<HTMLCanvasElement>(null);
 
@@ -56,33 +58,86 @@ function FrameTile({
   return (
     <div className="tile">
       {tile ? <canvas ref={ref} /> : <div className="tile-missing">no frame</div>}
-      <span className="tile-caption">{caption}</span>
+      {caption && <span className="tile-caption">{caption}</span>}
     </div>
   );
 }
 
-function ScoreBadge({ score }: { score: number }) {
+function ScoreBadge({ score, small }: { score: number; small?: boolean }) {
   const tone = score >= 80 ? "good" : score >= 60 ? "ok" : "poor";
-  return <span className={`score score-${tone}`}>{Math.round(score)}</span>;
+  return (
+    <span className={`score score-${tone}${small ? " score-small" : ""}`}>
+      {Math.round(score)}
+    </span>
+  );
 }
 
-function PositionRow({
+/**
+ * All 8 positions at a glance, the equivalent of the Python's contact sheet.
+ * Tapping one opens it below at full size.
+ */
+function ContactSheet({
+  results,
+  selected,
+  onSelect,
+}: {
+  results: Results;
+  selected: EventName;
+  onSelect: (name: EventName) => void;
+}) {
+  const { yours, pro, similarity } = results;
+  return (
+    <div className="sheet">
+      {EVENTS.map((name) => {
+        const position = similarity?.[name] ?? null;
+        return (
+          <button
+            key={name}
+            type="button"
+            className={`cell${name === selected ? " is-selected" : ""}`}
+            onClick={() => onSelect(name)}
+            aria-pressed={name === selected}
+          >
+            <span className="cell-head">
+              <span className="cell-name">{label(name)}</span>
+              {position && <ScoreBadge score={position.score} small />}
+            </span>
+            <span className="cell-frames">
+              <FrameTile
+                tile={yours.tiles[name]}
+                pose={yours.poses[yours.events[name]] ?? null}
+                scale={yours.tileScale}
+              />
+              {pro && (
+                <FrameTile
+                  tile={pro.tiles[name]}
+                  pose={pro.poses[pro.events[name]] ?? null}
+                  scale={pro.tileScale}
+                />
+              )}
+            </span>
+          </button>
+        );
+      })}
+    </div>
+  );
+}
+
+/** The selected position, large. */
+function PositionDetail({
   name,
-  yours,
-  pro,
-  similarity,
+  results,
 }: {
   name: EventName;
-  yours: SwingAnalysis;
-  pro: SwingAnalysis | null;
-  similarity: Similarity | null;
+  results: Results;
 }) {
+  const { yours, pro, similarity } = results;
   const position = similarity?.[name] ?? null;
 
   return (
-    <section className="position">
-      <header className="position-head">
-        <h3>{name.replace(/_/g, " ")}</h3>
+    <section className="detail">
+      <header className="detail-head">
+        <h2>{label(name)}</h2>
         {position && <ScoreBadge score={position.score} />}
       </header>
 
@@ -91,14 +146,14 @@ function PositionRow({
           tile={yours.tiles[name]}
           pose={yours.poses[yours.events[name]] ?? null}
           scale={yours.tileScale}
-          caption={pro ? "you" : `frame ${yours.events[name]}`}
+          caption={`you · frame ${yours.events[name]}`}
         />
         {pro && (
           <FrameTile
             tile={pro.tiles[name]}
             pose={pro.poses[pro.events[name]] ?? null}
             scale={pro.tileScale}
-            caption="reference"
+            caption={`reference · frame ${pro.events[name]}`}
           />
         )}
       </div>
@@ -116,7 +171,7 @@ function PositionRow({
 }
 
 function Diagnostics({
-  label,
+  label: text,
   analysis,
 }: {
   label: string;
@@ -124,7 +179,7 @@ function Diagnostics({
 }) {
   return (
     <li>
-      <strong>{label}:</strong> {analysis.frameCount} frames at{" "}
+      <strong>{text}:</strong> {analysis.frameCount} frames at{" "}
       {analysis.fps.toFixed(1)} fps, {analysis.width}&times;{analysis.height}
       {analysis.droppedFrames > 0 && (
         <span className="warn">, {analysis.droppedFrames} dropped</span>
@@ -141,6 +196,7 @@ export default function App() {
   const [status, setStatus] = useState("");
   const [error, setError] = useState("");
   const [results, setResults] = useState<Results | null>(null);
+  const [selected, setSelected] = useState<EventName>("impact");
 
   const run = useCallback(async () => {
     if (!yourFile) return;
@@ -150,15 +206,15 @@ export default function App() {
     const startedAt = performance.now();
 
     try {
-      const analyse = (file: File, label: string) =>
+      const analyse = (file: File, name: string) =>
         analyzeSwing(file, {
           model,
           onProgress: ({ phase, done, total }) => {
             const scope = total ? `${done}/${total}` : `${done}`;
             setStatus(
               phase === "tracking"
-                ? `Tracking ${label}: ${scope} frames`
-                : `Extracting ${label}: ${scope} frames`,
+                ? `Tracking ${name}: ${scope} frames`
+                : `Extracting ${name}: ${scope} frames`,
             );
           },
         });
@@ -166,6 +222,7 @@ export default function App() {
       const yours = await analyse(yourFile, "your swing");
       const pro = proFile ? await analyse(proFile, "the reference") : null;
 
+      setSelected("impact");
       setResults({
         yours,
         pro,
@@ -256,15 +313,12 @@ export default function App() {
             </div>
           )}
 
-          {EVENTS.map((name) => (
-            <PositionRow
-              key={name}
-              name={name}
-              yours={results.yours}
-              pro={results.pro}
-              similarity={results.similarity}
-            />
-          ))}
+          <ContactSheet
+            results={results}
+            selected={selected}
+            onSelect={setSelected}
+          />
+          <PositionDetail name={selected} results={results} />
 
           <details className="diagnostics">
             <summary>Diagnostics</summary>
