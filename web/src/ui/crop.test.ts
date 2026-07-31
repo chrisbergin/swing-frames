@@ -1,6 +1,6 @@
 import { describe, it, expect } from "vitest";
 import { LM, type Pose } from "../core/constants";
-import { golferCrop } from "./crop";
+import { poseAnchor, resolveCrops, videoAnchor } from "./crop";
 
 /** A 33-point pose with the landmarks the crop reads placed explicitly. */
 function standingPose({
@@ -22,35 +22,80 @@ function standingPose({
   return pose;
 }
 
-describe("golferCrop", () => {
-  const pose = standingPose({ shoulderY: 400, ankleY: 900, hipX: 500 });
-  const crop = golferCrop(pose, 1920)!;
-
-  it("sizes the crop from the shoulder-to-ankle span", () => {
-    expect(crop.sh).toBeCloseTo(2.0 * 500, 6);
-    expect(crop.sw / crop.sh).toBeCloseTo(0.75, 6);
+describe("poseAnchor", () => {
+  it("reads span, feet line, and centre from the body", () => {
+    const anchor = poseAnchor(
+      standingPose({ shoulderY: 400, ankleY: 900, hipX: 500 }),
+      1920,
+    )!;
+    expect(anchor.span).toBeCloseTo(500, 6);
+    expect(anchor.feetY).toBeCloseTo(900 + 0.06 * 500, 6);
+    expect(anchor.cx).toBeCloseTo(500, 6);
   });
 
-  it("puts the feet on the standard line", () => {
-    const feetY = 900 + 0.06 * 500;
-    expect((feetY - crop.sy) / crop.sh).toBeCloseTo(0.84, 6);
-  });
-
-  it("centres on the hips", () => {
-    expect(crop.sx + crop.sw / 2).toBeCloseTo(500, 6);
-  });
-
-  it("scales with distance: half the span means half the crop", () => {
-    const far = standingPose({ shoulderY: 650, ankleY: 900, hipX: 500 });
-    const farCrop = golferCrop(far, 1920)!;
-    expect(farCrop.sh).toBeCloseTo(crop.sh / 2, 6);
-  });
-
-  it("rejects a degenerate pose", () => {
-    const flat = standingPose({ shoulderY: 900, ankleY: 900, hipX: 500 });
-    expect(golferCrop(flat, 1920)).toBeNull();
-    // A tiny golfer (under 5% of frame height) cannot anchor a crop either.
+  it("rejects a tiny or disordered pose", () => {
     const tiny = standingPose({ shoulderY: 890, ankleY: 900, hipX: 500 });
-    expect(golferCrop(tiny, 1920)).toBeNull();
+    expect(poseAnchor(tiny, 1920)).toBeNull();
+    const garbage = standingPose({ shoulderY: 400, ankleY: 900, hipX: 500 });
+    garbage[LM.L_HIP].y = 300; // hips above shoulders: not a standing human
+    garbage[LM.R_HIP].y = 300;
+    expect(poseAnchor(garbage, 1920)).toBeNull();
+  });
+});
+
+describe("videoAnchor", () => {
+  it("takes the median so one bad pose cannot move the crop", () => {
+    const good = standingPose({ shoulderY: 400, ankleY: 900, hipX: 500 });
+    const drifted = standingPose({ shoulderY: 410, ankleY: 902, hipX: 505 });
+    const wild = standingPose({ shoulderY: 700, ankleY: 1900, hipX: 900 });
+    const anchor = videoAnchor([good, drifted, wild, null], 1920)!;
+    expect(anchor.span).toBeCloseTo(500, 6);
+    expect(anchor.cx).toBeCloseTo(505, 6);
+  });
+
+  it("is null when no pose is usable", () => {
+    expect(videoAnchor([null, null], 1920)).toBeNull();
+  });
+});
+
+describe("resolveCrops", () => {
+  const anchor = poseAnchor(
+    standingPose({ shoulderY: 400, ankleY: 900, hipX: 500 }),
+    1920,
+  )!;
+
+  it("anchors the vertical window on the feet line", () => {
+    const [crop] = resolveCrops([{ anchor, frameWidth: 1080 }]);
+    expect(crop!.sh).toBeCloseTo(2.0 * 500, 6);
+    expect((anchor.feetY - crop!.sy) / crop!.sh).toBeCloseTo(0.84, 6);
+  });
+
+  it("shares one window shape across both videos", () => {
+    const zoomed = poseAnchor(
+      standingPose({ shoulderY: 100, ankleY: 900, hipX: 250 }),
+      1000,
+    )!;
+    // The zoomed clip is only 900 wide against a 1600-tall window, so both
+    // sides narrow to the same 900/1600 aspect instead of letterboxing it.
+    const [a, b] = resolveCrops([
+      { anchor, frameWidth: 1080 },
+      { anchor: zoomed, frameWidth: 900 },
+    ]);
+    expect(a!.sw / a!.sh).toBeCloseTo(b!.sw / b!.sh, 6);
+    expect(b!.sw).toBeLessThanOrEqual(900 + 1e-6);
+  });
+
+  it("clamps sideways instead of letterboxing near an edge", () => {
+    const nearEdge = poseAnchor(
+      standingPose({ shoulderY: 400, ankleY: 900, hipX: 80 }),
+      1920,
+    )!;
+    const [crop] = resolveCrops([{ anchor: nearEdge, frameWidth: 1080 }]);
+    expect(crop!.sx).toBe(0);
+  });
+
+  it("never narrows below the minimum aspect", () => {
+    const [a] = resolveCrops([{ anchor, frameWidth: 100 }]);
+    expect(a!.sw / a!.sh).toBeCloseTo(0.5, 6);
   });
 });

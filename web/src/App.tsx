@@ -7,13 +7,13 @@
  * push a few hundred megabytes of slo-mo somewhere.
  */
 
-import { useCallback, useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import "./App.css";
 import { biggestGaps, overallScore, type Similarity } from "./core/angles";
 import { EVENTS, type EventName, type Pose } from "./core/constants";
 import { analyzeSwing, compareAnalyses, type SwingAnalysis } from "./pipeline";
 import type { ModelName } from "./pose/landmarker";
-import { golferCrop, type CropRect } from "./ui/crop";
+import { resolveCrops, videoAnchor, type CropRect } from "./ui/crop";
 import { drawPose } from "./ui/draw";
 import type { Rotation } from "./video/decode";
 
@@ -190,14 +190,22 @@ function PositionDetail({
   const position = similarity?.[name] ?? null;
   const touch = useRef<{ x: number; y: number } | null>(null);
 
-  const cropFor = (analysis: SwingAnalysis): CropRect | null => {
-    const pose = analysis.eventPoses[name];
-    const tile = analysis.tiles[name];
-    if (!align || !pose || !tile) return null;
-    return golferCrop(pose, tile.height);
-  };
-  const yoursCrop = cropFor(yours);
-  const proCrop = pro ? cropFor(pro) : null;
+  // One crop per video, anchored on the median across all 8 poses, so the
+  // view stays still while stepping and one bad pose cannot bend it. The
+  // window shape is resolved jointly so neither side needs letterboxing.
+  const [yoursCrop, proCrop] = useMemo<Array<CropRect | null>>(() => {
+    if (!align) return [null, null];
+    const sideFor = (analysis: SwingAnalysis) => {
+      const tile = EVENTS.map((n) => analysis.tiles[n]).find((t) => t !== null);
+      if (!tile) return { anchor: null, frameWidth: 0 };
+      const poses = EVENTS.map((n) => analysis.eventPoses[n]);
+      return { anchor: videoAnchor(poses, tile.height), frameWidth: tile.width };
+    };
+    const sides = [sideFor(yours)];
+    if (pro) sides.push(sideFor(pro));
+    const crops = resolveCrops(sides);
+    return [crops[0], crops[1] ?? null];
+  }, [align, yours, pro]);
 
   return (
     <section
