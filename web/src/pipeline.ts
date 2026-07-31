@@ -36,7 +36,9 @@ import { createLandmarker, firstPose, type ModelName } from "./pose/landmarker";
 import {
   captureFrame,
   drawRotatedFrame,
+  isBlankCanvas,
   sampleAtTimes,
+  settleDelay,
   type Rotation,
 } from "./video/decode";
 
@@ -171,6 +173,8 @@ export async function analyzeSwing(
   const landmarker = await createLandmarker("IMAGE", { model });
   let posesRun = 0;
   let posesFound = 0;
+  // Filled in as soon as they are known, so a failure can still report them.
+  let clip = { durationSec: 0, width: 0, height: 0 };
 
   // With a rotation set, detection runs on this scratch canvas instead of the
   // video element. Reuse is safe: MediaPipe reads it synchronously.
@@ -201,10 +205,13 @@ export async function analyzeSwing(
     const meta = await sampleAtTimes(
       file,
       (durationSec) => {
+        clip.durationSec = durationSec;
         samples = coarseSamples ?? coarseSampleCount(durationSec);
         return planSampleTimes(durationSec, samples);
       },
       ({ video, timeSec }) => {
+        clip.width = video.videoWidth;
+        clip.height = video.videoHeight;
         coarsePoses.push(detectCurrentFrame(video));
         coarseTimes.push(timeSec);
         onProgress?.({
@@ -283,9 +290,15 @@ export async function analyzeSwing(
     await sampleAtTimes(
       file,
       () => order.map((name) => eventTimes[name]),
-      ({ video, timeSec, index }) => {
+      async ({ video, timeSec, index }) => {
         const name = order[index];
-        const tile = captureFrame(video, maxTileSize, rotate);
+        let tile = captureFrame(video, maxTileSize, rotate);
+        // iOS Safari can still hand over a black frame right after a seek.
+        // A blank capture is detectable, so retry it rather than display it.
+        for (let attempt = 0; attempt < 3 && isBlankCanvas(tile); attempt++) {
+          await settleDelay();
+          tile = captureFrame(video, maxTileSize, rotate);
+        }
         tiles[name] = tile;
         // Pose the tile rather than the video: angles are scale-invariant, and
         // this way the overlay is already in the tile's coordinates.
@@ -313,6 +326,15 @@ export async function analyzeSwing(
       eventPoses,
       tiles,
     };
+  } catch (err) {
+    // A failure should carry the numbers that explain it: with them on
+    // screen, a bad clip is distinguishable from a bad app at a glance.
+    if (err instanceof Error && clip.width > 0) {
+      err.message +=
+        ` [clip: ${clip.durationSec.toFixed(1)}s, ${clip.width}×${clip.height}, ` +
+        `golfer found in ${posesFound} of ${posesRun} detections]`;
+    }
+    throw err;
   } finally {
     landmarker.close();
   }

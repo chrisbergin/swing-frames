@@ -85,11 +85,60 @@ export async function loadVideo(
 
   try {
     await once(video, "loadedmetadata", signal);
+    // iOS Safari hands the canvas black frames from a video that has never
+    // played, however long it has been seeked and waited on. One muted
+    // play/pause primes the decoder. Autoplay refusal just means no priming,
+    // so it is not an error worth surfacing.
+    try {
+      const playing = video.play();
+      if (playing) {
+        await Promise.race([
+          playing,
+          new Promise((r) => setTimeout(r, 300)),
+        ]);
+      }
+    } catch {
+      /* see above */
+    }
+    video.pause();
   } catch (err) {
     release();
     throw err;
   }
   return { video, release };
+}
+
+/**
+ * Give the decoder a beat to land pixels after a seek.
+ *
+ * The "seeked" event only says the media clock moved: on iOS Safari the frame
+ * itself can arrive at the canvas after it. This wait is paid only when a
+ * capture actually came back blank, never on the happy path: the video element
+ * is detached, therefore never composited, therefore
+ * requestVideoFrameCallback never fires for it and cannot be awaited instead.
+ */
+export function settleDelay(ms = 200): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+/**
+ * Whether a canvas holds (near-)nothing but black pixels.
+ *
+ * Reads a coarse 8x8 downsample rather than the full frame; a real video frame
+ * always has some pixel above the threshold, even at night at the range.
+ */
+export function isBlankCanvas(canvas: HTMLCanvasElement): boolean {
+  const probe = document.createElement("canvas");
+  probe.width = 8;
+  probe.height = 8;
+  const ctx = probe.getContext("2d", { willReadFrequently: true });
+  if (!ctx) return false;
+  ctx.drawImage(canvas, 0, 0, 8, 8);
+  const { data } = ctx.getImageData(0, 0, 8, 8);
+  for (let i = 0; i < data.length; i += 4) {
+    if (data[i] > 16 || data[i + 1] > 16 || data[i + 2] > 16) return false;
+  }
+  return true;
 }
 
 /** How long to wait on a single seek before giving up and using what is there. */
@@ -139,7 +188,7 @@ export interface SampledFrame {
 export async function sampleAtTimes(
   file: Blob,
   plan: (durationSec: number) => number[],
-  onSample: (sample: SampledFrame) => void,
+  onSample: (sample: SampledFrame) => void | Promise<void>,
   { signal }: { signal?: AbortSignal } = {},
 ): Promise<{ width: number; height: number; durationSec: number; samples: number }> {
   const { video, release } = await loadVideo(file, signal);
@@ -171,7 +220,7 @@ export async function sampleAtTimes(
         await onceWithTimeout(video, "seeked", SEEK_TIMEOUT_MS, signal);
       }
 
-      onSample({ video, timeSec: video.currentTime, index });
+      await onSample({ video, timeSec: video.currentTime, index });
       index++;
     }
 
