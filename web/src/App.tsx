@@ -128,22 +128,62 @@ function ContactSheet({
   );
 }
 
-/** The selected position, large. */
+/** The selected position, large. Arrows, swipe, and arrow keys step through. */
 function PositionDetail({
   name,
   results,
+  onStep,
 }: {
   name: EventName;
   results: Results;
+  onStep: (delta: number) => void;
 }) {
   const { yours, pro, similarity } = results;
   const position = similarity?.[name] ?? null;
+  const touch = useRef<{ x: number; y: number } | null>(null);
 
   return (
-    <section className="detail">
+    <section
+      className="detail"
+      onTouchStart={(e) => {
+        touch.current = { x: e.touches[0].clientX, y: e.touches[0].clientY };
+      }}
+      onTouchEnd={(e) => {
+        if (!touch.current) return;
+        const dx = e.changedTouches[0].clientX - touch.current.x;
+        const dy = e.changedTouches[0].clientY - touch.current.y;
+        touch.current = null;
+        // A clearly horizontal gesture only, so vertical scrolling never
+        // changes the position by accident.
+        if (Math.abs(dx) > 48 && Math.abs(dx) > 1.5 * Math.abs(dy)) {
+          onStep(dx < 0 ? 1 : -1);
+        }
+      }}
+    >
       <header className="detail-head">
-        <h2>{label(name)}</h2>
-        {position && <ScoreBadge score={position.score} />}
+        <button
+          type="button"
+          className="nav-btn"
+          aria-label="previous position"
+          onClick={() => onStep(-1)}
+        >
+          ‹
+        </button>
+        <div className="detail-title">
+          <h2>{label(name)}</h2>
+          {position && <ScoreBadge score={position.score} />}
+          <span className="detail-count">
+            {EVENTS.indexOf(name) + 1} / {EVENTS.length}
+          </span>
+        </div>
+        <button
+          type="button"
+          className="nav-btn"
+          aria-label="next position"
+          onClick={() => onStep(1)}
+        >
+          ›
+        </button>
       </header>
 
       <div className="frames">
@@ -252,6 +292,25 @@ export default function App() {
   const [error, setError] = useState("");
   const [results, setResults] = useState<Results | null>(null);
   const [selected, setSelected] = useState<EventName>("impact");
+  const detailRef = useRef<HTMLDivElement>(null);
+
+  const step = useCallback((delta: number) => {
+    setSelected(
+      (cur) =>
+        EVENTS[(EVENTS.indexOf(cur) + delta + EVENTS.length) % EVENTS.length],
+    );
+  }, []);
+
+  // Desktop nicety: arrow keys step through the positions too.
+  useEffect(() => {
+    if (!results) return;
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key === "ArrowLeft") step(-1);
+      if (e.key === "ArrowRight") step(1);
+    };
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, [results, step]);
 
   const run = useCallback(async () => {
     if (!yourFile) return;
@@ -396,9 +455,19 @@ export default function App() {
           <ContactSheet
             results={results}
             selected={selected}
-            onSelect={setSelected}
+            onSelect={(name) => {
+              setSelected(name);
+              // Tapping a cell used to mean scrolling back down by hand;
+              // bring the big view along instead.
+              detailRef.current?.scrollIntoView({
+                behavior: "smooth",
+                block: "start",
+              });
+            }}
           />
-          <PositionDetail name={selected} results={results} />
+          <div ref={detailRef}>
+            <PositionDetail name={selected} results={results} onStep={step} />
+          </div>
 
           <details className="diagnostics">
             <summary>Diagnostics</summary>

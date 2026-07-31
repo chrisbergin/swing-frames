@@ -224,6 +224,34 @@ button:disabled {
   text-transform: capitalize;
 }
 
+.detail-title {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  min-width: 0;
+  flex-wrap: wrap;
+  justify-content: center;
+}
+
+.detail-count {
+  font-size: 0.78rem;
+  opacity: 0.6;
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+}
+
+/* Position stepper: quiet, but comfortably tappable. */
+.nav-btn {
+  background: var(--panel);
+  color: var(--text-h);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 8px 16px;
+  font-size: 1.25rem;
+  line-height: 1;
+  flex-shrink: 0;
+}
+
 /* Cap the height so a portrait clip does not push everything off screen. */
 .detail .tile canvas {
   max-height: 58vh;
