@@ -45,7 +45,7 @@ export interface AnalyzeOptions {
   model?: ModelName;
   /** Long-side cap for retained frames. Tiles are displayed small anyway. */
   maxTileSize?: number;
-  /** How many poses to spread across the clip in the first pass. */
+  /** Fixed pose count for the first pass. Defaults to scaling with duration. */
   coarseSamples?: number;
   onProgress?: (progress: AnalyzeProgress) => void;
   signal?: AbortSignal;
@@ -79,6 +79,30 @@ export interface SwingAnalysis {
  * swing. Around 48 leaves good margin.
  */
 export const DEFAULT_COARSE_SAMPLES = 48;
+
+/**
+ * How finely to sample, and the bounds on it.
+ *
+ * A fixed sample count gives a short clip fine resolution and a long one
+ * almost none: 48 samples is one every 0.09s across a 4 second phone video,
+ * but one every 0.63s across a 30 second analysis video, which is coarse
+ * enough to land in the wrong freeze frame entirely. Measured on the pro
+ * reference clip, that cost about 15 points of similarity score. So aim for a
+ * time resolution instead, with a ceiling to keep a long clip from costing
+ * hundreds of detections.
+ */
+const TARGET_SAMPLE_INTERVAL_SEC = 0.1;
+const MAX_COARSE_SAMPLES = 150;
+
+/** Sample count giving roughly a fixed time resolution, within bounds. */
+export function coarseSampleCount(durationSec: number): number {
+  if (!(durationSec > 0)) return DEFAULT_COARSE_SAMPLES;
+  const wanted = Math.round(durationSec / TARGET_SAMPLE_INTERVAL_SEC);
+  return Math.max(
+    DEFAULT_COARSE_SAMPLES,
+    Math.min(wanted, MAX_COARSE_SAMPLES),
+  );
+}
 
 /** Samples per impact-narrowing round, and how many rounds to run. */
 const REFINE_SAMPLES = 12;
@@ -128,7 +152,7 @@ export async function analyzeSwing(
   {
     model = "full",
     maxTileSize = 720,
-    coarseSamples = DEFAULT_COARSE_SAMPLES,
+    coarseSamples,
     onProgress,
     signal,
   }: AnalyzeOptions = {},
@@ -140,10 +164,14 @@ export async function analyzeSwing(
     // 1. Coarse pass: the shape of the swing.
     const coarsePoses: Array<Pose | null> = [];
     const coarseTimes: number[] = [];
+    let samples = coarseSamples ?? DEFAULT_COARSE_SAMPLES;
 
     const meta = await sampleAtTimes(
       file,
-      (durationSec) => planSampleTimes(durationSec, coarseSamples),
+      (durationSec) => {
+        samples = coarseSamples ?? coarseSampleCount(durationSec);
+        return planSampleTimes(durationSec, samples);
+      },
       ({ video, timeSec }) => {
         const pose = firstPose(
           landmarker.detect(video),
@@ -156,7 +184,7 @@ export async function analyzeSwing(
         onProgress?.({
           phase: "tracking",
           done: coarsePoses.length,
-          total: coarseSamples,
+          total: samples,
         });
       },
       { signal },
@@ -180,7 +208,7 @@ export async function analyzeSwing(
 
     // 2. Narrow impact. Each round searches a window a fraction of the last,
     // so a couple of rounds get from a coarse sample down to a single frame.
-    let halfWidth = sampleIntervalSeconds(meta.durationSec, coarseSamples) * 1.5;
+    let halfWidth = sampleIntervalSeconds(meta.durationSec, samples) * 1.5;
 
     for (let round = 0; round < REFINE_ROUNDS; round++) {
       const measured: Array<{ time: number; y: number }> = [];

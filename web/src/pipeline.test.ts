@@ -1,5 +1,6 @@
 import { describe, it, expect } from "vitest";
 import {
+  coarseSampleCount,
   DEFAULT_COARSE_SAMPLES,
   planSampleTimes,
   planWindowTimes,
@@ -63,3 +64,27 @@ describe("planWindowTimes", () => {
   });
 });
 
+
+describe("coarseSampleCount", () => {
+  it("aims for a time resolution rather than a fixed count", () => {
+    // A 30s analysis clip at a fixed 48 samples lands one every 0.63s, coarse
+    // enough to pick the wrong freeze frame.
+    expect(coarseSampleCount(30)).toBeGreaterThan(DEFAULT_COARSE_SAMPLES);
+    expect(30 / coarseSampleCount(30)).toBeLessThan(0.63);
+  });
+
+  it("never drops below the floor on a short clip", () => {
+    expect(coarseSampleCount(1)).toBe(DEFAULT_COARSE_SAMPLES);
+    expect(coarseSampleCount(4.2)).toBe(DEFAULT_COARSE_SAMPLES);
+  });
+
+  it("caps a long clip so cost stays bounded", () => {
+    expect(coarseSampleCount(600)).toBe(coarseSampleCount(6000));
+    expect(coarseSampleCount(600)).toBeLessThanOrEqual(150);
+  });
+
+  it("falls back for a clip with no usable duration", () => {
+    expect(coarseSampleCount(0)).toBe(DEFAULT_COARSE_SAMPLES);
+    expect(coarseSampleCount(NaN)).toBe(DEFAULT_COARSE_SAMPLES);
+  });
+});

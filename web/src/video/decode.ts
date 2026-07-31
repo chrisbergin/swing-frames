@@ -264,6 +264,29 @@ export async function walkVideoFrames(
   }
 }
 
+/** How long to wait on a single seek before giving up and using what is there. */
+const SEEK_TIMEOUT_MS = 3000;
+
+/** Wait for an event, but never indefinitely. Resolves either way. */
+function onceWithTimeout(
+  target: EventTarget,
+  event: string,
+  timeoutMs: number,
+  signal?: AbortSignal,
+): Promise<void> {
+  return new Promise((resolve) => {
+    const done = () => {
+      clearTimeout(timer);
+      target.removeEventListener(event, done);
+      signal?.removeEventListener("abort", done);
+      resolve();
+    };
+    const timer = setTimeout(done, timeoutMs);
+    target.addEventListener(event, done, { once: true });
+    signal?.addEventListener("abort", done, { once: true });
+  });
+}
+
 /** One frame fetched by seeking, with the time it actually landed on. */
 export interface SampledFrame {
   video: HTMLVideoElement;
@@ -294,14 +317,32 @@ export async function sampleAtTimes(
   const { video, release } = await loadVideo(file, signal);
 
   try {
+    // Metadata alone means duration and dimensions are known but no frame has
+    // been decoded yet. Reading pixels now would give a blank one.
+    if (video.readyState < 2 /* HAVE_CURRENT_DATA */) {
+      await onceWithTimeout(video, "loadeddata", SEEK_TIMEOUT_MS, signal);
+    }
+
     const times = plan(video.duration);
     let index = 0;
 
     for (const target of times) {
       if (signal?.aborted) throw new Error("Cancelled.");
       // Clamp inside the media: seeking to exactly duration can never resolve.
-      video.currentTime = Math.max(0, Math.min(target, video.duration - 1e-3));
-      await once(video, "seeked", signal);
+      const clamped = Math.max(0, Math.min(target, video.duration - 1e-3));
+
+      // Assigning currentTime the value it already holds fires no "seeked"
+      // event, so waiting for one hangs forever. Two positions landing on the
+      // same time is ordinary, not exotic, on a clip full of freeze frames.
+      // Tolerance is well under a frame even at 240fps.
+      if (Math.abs(video.currentTime - clamped) > 1e-3) {
+        video.currentTime = clamped;
+        // Belt and braces: a seek that never reports back must not take the
+        // whole analysis down with it. Carrying on gives a slightly wrong
+        // frame, which beats hanging with no way out.
+        await onceWithTimeout(video, "seeked", SEEK_TIMEOUT_MS, signal);
+      }
+
       onSample({ video, timeSec: video.currentTime, index });
       index++;
     }
