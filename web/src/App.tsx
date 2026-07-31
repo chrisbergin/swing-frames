@@ -34,12 +34,10 @@ const label = (name: EventName) => name.replace(/_/g, " ");
 function FrameTile({
   tile,
   pose,
-  scale,
   caption,
 }: {
   tile: HTMLCanvasElement | null;
   pose: Pose | null;
-  scale: number;
   caption?: string;
 }) {
   const ref = useRef<HTMLCanvasElement>(null);
@@ -52,8 +50,9 @@ function FrameTile({
     const ctx = canvas.getContext("2d");
     if (!ctx) return;
     ctx.drawImage(tile, 0, 0);
-    if (pose) drawPose(ctx, pose, scale);
-  }, [tile, pose, scale]);
+    // Poses are measured off the tile, so they are already in its coordinates.
+    if (pose) drawPose(ctx, pose, 1);
+  }, [tile, pose]);
 
   return (
     <div className="tile">
@@ -105,14 +104,12 @@ function ContactSheet({
             <span className="cell-frames">
               <FrameTile
                 tile={yours.tiles[name]}
-                pose={yours.poses[yours.events[name]] ?? null}
-                scale={yours.tileScale}
+                pose={yours.eventPoses[name]}
               />
               {pro && (
                 <FrameTile
                   tile={pro.tiles[name]}
-                  pose={pro.poses[pro.events[name]] ?? null}
-                  scale={pro.tileScale}
+                  pose={pro.eventPoses[name]}
                 />
               )}
             </span>
@@ -144,15 +141,13 @@ function PositionDetail({
       <div className="frames">
         <FrameTile
           tile={yours.tiles[name]}
-          pose={yours.poses[yours.events[name]] ?? null}
-          scale={yours.tileScale}
+          pose={yours.eventPoses[name]}
           caption={`you · frame ${yours.events[name]}`}
         />
         {pro && (
           <FrameTile
             tile={pro.tiles[name]}
-            pose={pro.poses[pro.events[name]] ?? null}
-            scale={pro.tileScale}
+            pose={pro.eventPoses[name]}
             caption={`reference · frame ${pro.events[name]}`}
           />
         )}
@@ -181,6 +176,7 @@ function Diagnostics({
     <li>
       <strong>{text}:</strong> {analysis.frameCount} frames at{" "}
       {analysis.fps.toFixed(1)} fps, {analysis.width}&times;{analysis.height}
+      , {analysis.posesRun} poses
       {analysis.playbackRate < 1 && (
         <>, decoded at {Math.round(analysis.playbackRate * 100)}% speed</>
       )}

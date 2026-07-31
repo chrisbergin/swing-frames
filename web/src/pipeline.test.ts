@@ -1,41 +1,30 @@
 import { describe, it, expect } from "vitest";
 import {
+  DEFAULT_COARSE_SAMPLES,
   dropRate,
-  framesToRetain,
   MAX_DROP_RATE,
   retryPlaybackRate,
+  sampleIntervalSeconds,
 } from "./pipeline";
-import { EVENTS, type EventFrames } from "./core/constants";
 
-const events: EventFrames = {
-  address: 0,
-  toe_up: 35,
-  mid_backswing: 43,
-  top: 52,
-  mid_downswing: 60,
-  impact: 62,
-  mid_follow_through: 65,
-  finish: 72,
-};
-
-describe("framesToRetain", () => {
-  it("keeps every displayed position", () => {
-    const keep = framesToRetain(events, 58, 66);
-    for (const name of EVENTS) expect(keep.has(events[name])).toBe(true);
+describe("sampleIntervalSeconds", () => {
+  it("spreads the samples evenly across the clip", () => {
+    expect(sampleIntervalSeconds(4.8, 48)).toBeCloseTo(0.1, 10);
+    // A long clip is sampled more sparsely, which is the whole point: cost
+    // tracks the sample count, not the length of the video.
+    expect(sampleIntervalSeconds(60, 48)).toBeCloseTo(1.25, 10);
   });
 
-  it("keeps the whole impact window, since refinement can land anywhere in it", () => {
-    const keep = framesToRetain(events, 58, 66);
-    for (let i = 58; i < 66; i++) expect(keep.has(i)).toBe(true);
-    expect(keep.has(57)).toBe(false);
-    expect(keep.has(66)).toBe(false);
+  it("keeps a swing's worth of samples well above the episode threshold", () => {
+    // Detection needs at least 3 samples inside a hands-high episode, and
+    // there are two of those in a swing, so the sample count has to leave room.
+    expect(DEFAULT_COARSE_SAMPLES).toBeGreaterThan(3 * 2 * 4);
   });
 
-  it("counts frames that are both a position and in the window only once", () => {
-    // impact 62, mid_downswing 60 and mid_follow_through 65 all sit inside
-    // the window, so the total is the 8 positions plus the window minus those.
-    const keep = framesToRetain(events, 58, 66);
-    expect(keep.size).toBe(8 + 8 - 3);
+  it("disables sampling for a degenerate clip rather than dividing by zero", () => {
+    expect(sampleIntervalSeconds(0, 48)).toBe(0);
+    expect(sampleIntervalSeconds(NaN, 48)).toBe(0);
+    expect(sampleIntervalSeconds(4, 0)).toBe(0);
   });
 });
 

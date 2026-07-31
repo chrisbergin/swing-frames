@@ -1,20 +1,26 @@
 /**
- * End-to-end swing analysis: video file in, 8 labelled frames and a set of
- * poses out. The browser equivalent of process() in swing_frames.py.
+ * End-to-end swing analysis: video file in, 8 labelled frames and their poses
+ * out. The browser equivalent of process() in swing_frames.py.
  *
- * Runs as two sequential decode passes rather than one, because holding a
- * whole clip's frames in memory is not an option on a phone: a 240fps slo-mo
- * swing is hundreds of frames, and at full resolution that is gigabytes.
+ * Pose detection is the entire cost here: decoding a frame takes a millisecond
+ * or two, detecting a pose in one takes 40ms on a laptop and well over 100ms on
+ * a phone. So the clip is walked in full, because frames can only be reached in
+ * order, but pose runs on a sparse sample of it:
  *
- *   Pass 1  pose-detect every frame in VIDEO mode, keep only the landmarks,
- *           throw the pixels away. Detection needs nothing else.
- *   Pass 2  now that the positions are known, keep just the frames that will
- *           be shown, and re-measure the impact window in IMAGE mode.
+ *   Pass 1  pose roughly 48 frames spread evenly across the clip, and find the
+ *           swing's shape from those. Every other frame costs nothing.
+ *   Pass 2  now that the positions are roughly known, keep the frames worth
+ *           showing, and re-measure impact densely.
  *
- * Decoding twice is cheap next to pose detection, which dominates either way.
+ * The detection maths is unchanged and still matches the Python: it works on an
+ * array of hand heights and derives its window sizes from the frame rate, so
+ * feeding it 48 samples at the effective sample rate scales it automatically.
+ *
+ * Impact is the one position where a single frame matters, since it is a sharp
+ * minimum a sparse sample steps straight over. That is what pass 2 re-measures.
  */
 
-import { compareSwings, type Similarity } from "./core/angles";
+import { compareEventPoses, type Similarity } from "./core/angles";
 import {
   EVENTS,
   LM,
@@ -24,12 +30,15 @@ import {
 } from "./core/constants";
 import {
   detectEvents,
-  impactRefineWindow,
   selectImpactFrame,
   SwingDetectionError,
   wristTrack,
 } from "./core/events";
-import { createLandmarker, firstPose, type ModelName } from "./pose/landmarker";
+import {
+  createLandmarker,
+  firstPose,
+  type ModelName,
+} from "./pose/landmarker";
 import {
   captureFrame,
   walkVideoFrames,
@@ -39,7 +48,6 @@ import {
 export interface AnalyzeProgress {
   phase: "tracking" | "extracting";
   done: number;
-  /** Zero until pass 1 has finished, since the frame count is not known up front. */
   total: number;
   /** Below 1 when the decoder had to be slowed down to keep every frame. */
   playbackRate: number;
@@ -49,6 +57,8 @@ export interface AnalyzeOptions {
   model?: ModelName;
   /** Long-side cap for retained frames. Tiles are displayed small anyway. */
   maxTileSize?: number;
+  /** How many poses to spread across the clip in the first pass. */
+  coarseSamples?: number;
   /** Pin the playback speed. Left unset, it steps down until no frames drop. */
   playbackRate?: number;
   onProgress?: (progress: AnalyzeProgress) => void;
@@ -61,15 +71,39 @@ export interface SwingAnalysis {
   droppedFrames: number;
   width: number;
   height: number;
+  /** How many poses the first pass actually ran. */
+  posesRun: number;
   events: EventFrames;
-  /** Per-frame poses from pass 1, in source pixel coordinates. */
-  poses: Array<Pose | null>;
-  /** The 8 displayed frames, already scaled down. */
+  /** Pose at each position, in the coordinates of that position's tile. */
+  eventPoses: Record<EventName, Pose | null>;
   tiles: Record<EventName, HTMLCanvasElement | null>;
-  /** Multiply a source-pixel pose coordinate by this to land on a tile. */
-  tileScale: number;
   /** Speed the decoder settled on. Below 1 means this device needed slowing down. */
   playbackRate: number;
+}
+
+/**
+ * Enough samples to resolve the swing's shape, few enough to stay quick.
+ *
+ * The structure being looked for is two hands-high episodes, and the episode
+ * filter wants at least 3 samples inside one, so this needs to comfortably
+ * exceed the number of "phases" in a swing. Around 48 leaves good margin.
+ */
+export const DEFAULT_COARSE_SAMPLES = 48;
+
+/**
+ * How many coarse samples either side of the estimated impact to re-measure
+ * densely. Impact is a sharp minimum lasting a frame or two, so the coarse
+ * pass only ever gets near it, never on it.
+ */
+const IMPACT_WINDOW_SAMPLES = 2;
+
+/** Seconds between coarse samples. Zero disables sampling (pose every frame). */
+export function sampleIntervalSeconds(
+  durationSec: number,
+  samples: number,
+): number {
+  if (!(durationSec > 0) || samples <= 0) return 0;
+  return durationSec / samples;
 }
 
 /**
@@ -77,8 +111,7 @@ export interface SwingAnalysis {
  *
  * Dropped frames do not degrade gracefully. A run that lost 36 of 57 frames
  * still produced eight confident-looking tiles, but the frame rate came out at
- * 15fps instead of 27 and every position was wrong. Failing loudly beats
- * handing back a plausible answer that happens to be nonsense.
+ * 15fps instead of 27 and every position was wrong.
  */
 export const MAX_DROP_RATE = 0.05;
 
@@ -86,21 +119,6 @@ export const MAX_DROP_RATE = 0.05;
 export function dropRate(frameCount: number, droppedFrames: number): number {
   const total = frameCount + droppedFrames;
   return total === 0 ? 0 : droppedFrames / total;
-}
-
-/**
- * Which frames pass 2 needs to hold on to: the 8 positions, plus the whole
- * impact re-measure window, because refinement can move impact to any frame
- * in it and that frame still has to be displayable.
- */
-export function framesToRetain(
-  events: EventFrames,
-  windowLo: number,
-  windowHi: number,
-): Set<number> {
-  const keep = new Set<number>(EVENTS.map((e) => events[e]));
-  for (let i = windowLo; i < windowHi; i++) keep.add(i);
-  return keep;
 }
 
 /**
@@ -116,13 +134,9 @@ const MIN_PLAYBACK_RATE = 0.05;
 /**
  * Playback speed at which a frame's processing fits inside a frame interval.
  *
- * Pausing the media clock during the frame callback is supposed to make
- * processing speed irrelevant, and on desktop Chrome it does. Phones are
- * slower and the pause does not always take hold before the next frame is
- * presented, so the remaining lever is wall-clock time between frames: at
- * quarter speed a 30fps clip presents a frame every 133ms instead of every
- * 33ms. Deriving the rate from measured cost beats guessing at a ladder of
- * speeds, because it converges in one retry instead of several.
+ * Sparse sampling means most frames now cost nothing, so this should rarely be
+ * needed; it remains the backstop for a device slow enough that even the
+ * sampled frames overrun.
  */
 export function retryPlaybackRate(
   msPerFrame: number,
@@ -132,7 +146,6 @@ export function retryPlaybackRate(
   if (msPerFrame <= 0 || fps <= 0) return MIN_PLAYBACK_RATE;
   const frameIntervalMs = 1000 / fps;
   const rate = (frameIntervalMs * DUTY) / msPerFrame;
-  // Only ever slower than the attempt that just failed.
   return Math.max(MIN_PLAYBACK_RATE, Math.min(rate, currentRate * 0.8));
 }
 
@@ -141,57 +154,69 @@ export async function analyzeSwing(
   {
     model = "full",
     maxTileSize = 720,
+    coarseSamples = DEFAULT_COARSE_SAMPLES,
     playbackRate,
     onProgress,
     signal,
   }: AnalyzeOptions = {},
 ): Promise<SwingAnalysis> {
-  // Pass 1: landmarks only. Retried slower if the decoder could not keep up,
-  // since dropped frames do not degrade gracefully.
-  const poses: Array<Pose | null> = [];
+  // Pass 1: pose a sparse, evenly spaced sample of the clip.
+  const coarsePoses: Array<Pose | null> = [];
+  const sampleTimes: number[] = [];
   let walk!: WalkResult;
   let usedRate = playbackRate ?? 1;
 
-  // Two attempts at most: full speed, then one at a rate derived from how long
-  // this device actually took per frame.
   for (let attempt = 0; attempt < 2; attempt++) {
     // A fresh landmarker per attempt: VIDEO mode requires timestamps to keep
     // increasing, and a retry starts the clip over at zero.
-    const videoLandmarker = await createLandmarker("VIDEO", { model });
-    poses.length = 0;
+    const landmarker = await createLandmarker("VIDEO", { model });
+    coarsePoses.length = 0;
+    sampleTimes.length = 0;
     let processingMs = 0;
+    let interval = 0;
+    let nextSampleAt = 0;
     const rate = usedRate;
 
     try {
       walk = await walkVideoFrames(
         file,
-        (video, index, mediaTimeSec) => {
+        (video, _index, mediaTimeSec) => {
+          // Skipping is the whole point: this is the cheap path for most frames.
+          if (mediaTimeSec + 1e-9 < nextSampleAt) return;
+          nextSampleAt = mediaTimeSec + interval;
+
           const startedAt = performance.now();
-          const result = videoLandmarker.detectForVideo(
-            video,
-            mediaTimeSec * 1000,
+          const result = landmarker.detectForVideo(video, mediaTimeSec * 1000);
+          coarsePoses.push(
+            firstPose(result, video.videoWidth, video.videoHeight),
           );
-          poses.push(firstPose(result, video.videoWidth, video.videoHeight));
+          sampleTimes.push(mediaTimeSec);
           processingMs += performance.now() - startedAt;
+
           onProgress?.({
             phase: "tracking",
-            done: index + 1,
-            total: 0,
+            done: coarsePoses.length,
+            total: coarseSamples,
             playbackRate: rate,
           });
         },
-        { playbackRate: rate, signal },
+        {
+          playbackRate: rate,
+          onMetadata: ({ durationSec }) => {
+            interval = sampleIntervalSeconds(durationSec, coarseSamples);
+          },
+          signal,
+        },
       );
     } finally {
-      videoLandmarker.close();
+      landmarker.close();
     }
 
     if (dropRate(walk.frameCount, walk.droppedFrames) <= MAX_DROP_RATE) break;
-    // A pinned rate is the caller's decision, so do not second-guess it.
     if (playbackRate !== undefined) break;
 
     usedRate = retryPlaybackRate(
-      processingMs / Math.max(1, walk.frameCount),
+      processingMs / Math.max(1, coarsePoses.length),
       walk.fps,
       rate,
     );
@@ -206,32 +231,79 @@ export async function analyzeSwing(
     );
   }
 
-  const { ys } = wristTrack(poses, walk.fps);
-  const tracked = detectEvents(ys, walk.fps);
-  const { lo, hi } = impactRefineWindow(tracked, walk.fps, poses.length);
-  const retain = framesToRetain(tracked, lo, hi);
+  if (sampleTimes.length < 10) {
+    throw new SwingDetectionError(
+      `Only ${sampleTimes.length} frames could be read from this clip. It may be ` +
+        `too short, or in a format this browser cannot step through.`,
+    );
+  }
 
-  // Pass 2: keep the frames worth showing, and re-measure impact without the
-  // temporal prior that makes VIDEO mode lag the hands through the strike.
+  // Detection runs on the sample, so the rate it sees is the sample rate.
+  const span = sampleTimes[sampleTimes.length - 1] - sampleTimes[0];
+  const effectiveFps = span > 0 ? (sampleTimes.length - 1) / span : 30;
+  const { ys } = wristTrack(coarsePoses, effectiveFps);
+  const coarse = detectEvents(ys, effectiveFps);
+
+  // Positions come back as indices into the sample, so convert them to times,
+  // which is the only thing that means anything across two different passes.
+  const eventTimes = Object.fromEntries(
+    EVENTS.map((name) => [name, sampleTimes[coarse[name]]]),
+  ) as Record<EventName, number>;
+
+  const sampleInterval = span / Math.max(1, sampleTimes.length - 1);
+
+  // Pass 2: capture the frame nearest each position, and re-measure impact
+  // densely, since it is a sharp minimum the coarse sample steps over.
   const imageLandmarker = await createLandmarker("IMAGE", { model });
-  const kept = new Map<number, HTMLCanvasElement>();
-  const measured: Array<{ frame: number; y: number }> = [];
+  const best = new Map<
+    EventName,
+    { gap: number; frame: number; canvas: HTMLCanvasElement }
+  >();
+  // Impact's tile has to follow wherever the dense re-measure moves it, so the
+  // whole window is retained rather than just the coarse guess. It is a few
+  // frames either side, not the whole clip.
+  const impactWindow: Array<{
+    frame: number;
+    y: number;
+    canvas: HTMLCanvasElement;
+  }> = [];
+
   try {
     await walkVideoFrames(
       file,
-      (video, index) => {
-        if (index >= lo && index < hi) {
+      (video, index, mediaTimeSec) => {
+        // Wider than the other positions: the coarse guess for impact can sit
+        // a full sample away from the real strike, and the window has to
+        // bracket it or the dense re-measure has nothing to find.
+        if (
+          Math.abs(mediaTimeSec - eventTimes.impact) <=
+          sampleInterval * IMPACT_WINDOW_SAMPLES
+        ) {
           const pts = imageLandmarker.detect(video).landmarks[0];
           if (pts) {
-            measured.push({
+            impactWindow.push({
               frame: index,
+              canvas: captureFrame(video, maxTileSize),
               y:
                 ((pts[LM.L_WRIST].y + pts[LM.R_WRIST].y) / 2) *
                 video.videoHeight,
             });
           }
         }
-        if (retain.has(index)) kept.set(index, captureFrame(video, maxTileSize));
+
+        for (const name of EVENTS) {
+          const gap = Math.abs(mediaTimeSec - eventTimes[name]);
+          if (gap > sampleInterval) continue;
+          const held = best.get(name);
+          if (!held || gap < held.gap) {
+            best.set(name, {
+              gap,
+              frame: index,
+              canvas: captureFrame(video, maxTileSize),
+            });
+          }
+        }
+
         onProgress?.({
           phase: "extracting",
           done: index + 1,
@@ -239,37 +311,59 @@ export async function analyzeSwing(
           playbackRate: usedRate,
         });
       },
-      // Whatever speed pass 1 needed, since a device that could not keep up
-      // with pose detection will not keep up with capturing frames either.
       { playbackRate: usedRate, signal },
     );
+
+    const tiles = Object.fromEntries(
+      EVENTS.map((name) => [name, best.get(name)?.canvas ?? null]),
+    ) as Record<EventName, HTMLCanvasElement | null>;
+
+    // Impact moves to the densely measured frame, and its tile with it.
+    if (impactWindow.length > 0) {
+      const refined = selectImpactFrame(
+        impactWindow.map(({ frame, y }) => ({ frame, y })),
+        impactWindow[0].frame,
+      );
+      const at = impactWindow.find((m) => m.frame === refined);
+      if (at) {
+        tiles.impact = at.canvas;
+        best.set("impact", { gap: 0, frame: at.frame, canvas: at.canvas });
+      }
+    }
+
+    // Pose the 8 chosen frames off their tiles: eight detections rather than
+    // one per frame, and angles are scale-invariant so the downscale is fine.
+    const eventPoses = Object.fromEntries(
+      EVENTS.map((name) => {
+        const tile = tiles[name];
+        if (!tile) return [name, null];
+        return [name, firstPose(imageLandmarker.detect(tile), tile.width, tile.height)];
+      }),
+    ) as Record<EventName, Pose | null>;
+
+    // Frame numbers of the frames actually shown, against the real clip.
+    const events = Object.fromEntries(
+      EVENTS.map((name) => [
+        name,
+        best.get(name)?.frame ?? Math.round(eventTimes[name] * walk.fps),
+      ]),
+    ) as EventFrames;
+
+    return {
+      fps: walk.fps,
+      frameCount: walk.frameCount,
+      droppedFrames: walk.droppedFrames,
+      width: walk.width,
+      height: walk.height,
+      posesRun: coarsePoses.length,
+      events,
+      eventPoses,
+      tiles,
+      playbackRate: usedRate,
+    };
   } finally {
     imageLandmarker.close();
   }
-
-  const events: EventFrames = {
-    ...tracked,
-    impact: selectImpactFrame(measured, tracked.impact),
-  };
-
-  const tiles = Object.fromEntries(
-    EVENTS.map((name) => [name, kept.get(events[name]) ?? null]),
-  ) as Record<EventName, HTMLCanvasElement | null>;
-
-  const anyTile = EVENTS.map((e) => tiles[e]).find((t) => t !== null);
-
-  return {
-    fps: walk.fps,
-    frameCount: walk.frameCount,
-    droppedFrames: walk.droppedFrames,
-    width: walk.width,
-    height: walk.height,
-    events,
-    poses,
-    tiles,
-    tileScale: anyTile && walk.width ? anyTile.width / walk.width : 1,
-    playbackRate: usedRate,
-  };
 }
 
 /** Joint-angle similarity between two analysed swings. */
@@ -277,5 +371,5 @@ export function compareAnalyses(
   a: SwingAnalysis,
   b: SwingAnalysis,
 ): Similarity {
-  return compareSwings(a.poses, a.events, b.poses, b.events);
+  return compareEventPoses(a.eventPoses, b.eventPoses);
 }

@@ -102,11 +102,32 @@ export function compareSwings(
   posesB: (Pose | null)[],
   eventsB: EventFrames,
 ): Similarity {
+  return compareEventPoses(
+    Object.fromEntries(
+      EVENTS.map((n) => [n, posesA[eventsA[n]] ?? null]),
+    ) as Record<EventName, Pose | null>,
+    Object.fromEntries(
+      EVENTS.map((n) => [n, posesB[eventsB[n]] ?? null]),
+    ) as Record<EventName, Pose | null>,
+  );
+}
+
+/**
+ * Similarity from the poses at each position directly.
+ *
+ * Angles are scale-invariant, so the two sides do not have to be measured at
+ * the same resolution: poses taken off downscaled frames compare correctly
+ * against poses taken off full-size ones.
+ */
+export function compareEventPoses(
+  posesA: Record<EventName, Pose | null>,
+  posesB: Record<EventName, Pose | null>,
+): Similarity {
   const result = {} as Similarity;
 
   for (const name of EVENTS) {
-    const pa = posesA[eventsA[name]] ?? null;
-    const pb = posesB[eventsB[name]] ?? null;
+    const pa = posesA[name];
+    const pb = posesB[name];
     if (!pa || !pb) {
       result[name] = null;
       continue;

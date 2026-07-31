@@ -28,6 +28,11 @@ export interface WalkOptions {
    * frame for slow work, which is the lever for avoiding dropped frames.
    */
   playbackRate?: number;
+  /**
+   * Called once the video's duration and size are known, before any frame is
+   * handed over, so the caller can plan how densely to sample.
+   */
+  onMetadata?: (info: { durationSec: number; width: number; height: number }) => void;
   signal?: AbortSignal;
 }
 
@@ -169,11 +174,17 @@ export async function loadVideo(
 export async function walkVideoFrames(
   file: Blob,
   onFrame: (video: HTMLVideoElement, index: number, mediaTimeSec: number) => void,
-  { playbackRate = 1, signal }: WalkOptions = {},
+  { playbackRate = 1, onMetadata, signal }: WalkOptions = {},
 ): Promise<WalkResult> {
   const { video, release } = await loadVideo(file, signal);
 
   try {
+    onMetadata?.({
+      durationSec: video.duration,
+      width: video.videoWidth,
+      height: video.videoHeight,
+    });
+
     if (!("requestVideoFrameCallback" in video)) {
       throw new Error(
         "This browser cannot step through video frames " +
