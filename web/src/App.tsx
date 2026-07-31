@@ -367,9 +367,18 @@ export default function App() {
   const [status, setStatus] = useState("");
   const [error, setError] = useState("");
   const [results, setResults] = useState<Results | null>(null);
-  const [selected, setSelected] = useState<EventName>("impact");
+  const [selected, setSelected] = useState<EventName>("address");
   const [align, setAlign] = useState(true);
   const detailRef = useRef<HTMLDivElement>(null);
+  const resultsRef = useRef<HTMLDivElement>(null);
+
+  // The controls sit above a long results page; jump to the output when it
+  // lands rather than leaving the user to scroll past the pickers.
+  useEffect(() => {
+    if (results) {
+      resultsRef.current?.scrollIntoView({ behavior: "smooth", block: "start" });
+    }
+  }, [results]);
 
   const step = useCallback((delta: number) => {
     setSelected(
@@ -425,7 +434,7 @@ export default function App() {
         ? await analyse(proFile, "the reference", proRotate)
         : null;
 
-      setSelected("impact");
+      setSelected("address");
       setResults({
         yours,
         pro,
@@ -520,7 +529,7 @@ export default function App() {
       </details>
 
       {results && (
-        <>
+        <div ref={resultsRef}>
           {overall !== null && (
             <div className="overall">
               <span className="overall-label">Overall</span>
@@ -573,7 +582,7 @@ export default function App() {
               framing, low resolution, or a sideways video.
             </p>
           </details>
-        </>
+        </div>
       )}
     </main>
   );

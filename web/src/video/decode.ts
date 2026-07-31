@@ -121,24 +121,38 @@ export function settleDelay(ms = 200): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
-/**
- * Whether a canvas holds (near-)nothing but black pixels.
- *
- * Reads a coarse 8x8 downsample rather than the full frame; a real video frame
- * always has some pixel above the threshold, even at night at the range.
- */
-export function isBlankCanvas(canvas: HTMLCanvasElement): boolean {
+/** Coarse 8x8 luminance signature of a canvas, for cheap comparisons. */
+export function probeSignature(canvas: HTMLCanvasElement): number[] {
   const probe = document.createElement("canvas");
   probe.width = 8;
   probe.height = 8;
   const ctx = probe.getContext("2d", { willReadFrequently: true });
-  if (!ctx) return false;
+  if (!ctx) return [];
   ctx.drawImage(canvas, 0, 0, 8, 8);
   const { data } = ctx.getImageData(0, 0, 8, 8);
+  const sig: number[] = [];
   for (let i = 0; i < data.length; i += 4) {
-    if (data[i] > 16 || data[i + 1] > 16 || data[i + 2] > 16) return false;
+    sig.push(0.299 * data[i] + 0.587 * data[i + 1] + 0.114 * data[i + 2]);
   }
-  return true;
+  return sig;
+}
+
+/**
+ * Whether a canvas holds (near-)nothing but black pixels.
+ *
+ * A real video frame always has some pixel above the threshold, even at night
+ * at the range.
+ */
+export function isBlankCanvas(canvas: HTMLCanvasElement): boolean {
+  return probeSignature(canvas).every((v) => v <= 16);
+}
+
+/** Mean absolute difference between two probe signatures. */
+export function signatureDiff(a: readonly number[], b: readonly number[]): number {
+  if (a.length === 0 || a.length !== b.length) return Infinity;
+  let total = 0;
+  for (let i = 0; i < a.length; i++) total += Math.abs(a[i] - b[i]);
+  return total / a.length;
 }
 
 /** How long to wait on a single seek before giving up and using what is there. */
@@ -302,4 +316,37 @@ export function captureFrame(
   const canvas = document.createElement("canvas");
   drawRotatedFrame(canvas, video, rotation, scale);
   return canvas;
+}
+
+/**
+ * Capture the current frame, waiting out presentation glitches.
+ *
+ * Reading right after "seeked" is usually correct but not always: measured
+ * against sequential ground truth, an occasional capture holds a frame
+ * several frames away from where the seek landed (a different position each
+ * run), and on iOS a never-settled surface reads black. So capture until two
+ * consecutive reads agree: a settled frame converges immediately, a glitched
+ * one gets replaced by what the surface settles on.
+ */
+export async function captureSettledFrame(
+  video: HTMLVideoElement,
+  maxLongSide: number,
+  rotation: Rotation = 0,
+): Promise<HTMLCanvasElement> {
+  let tile = captureFrame(video, maxLongSide, rotation);
+  for (let attempt = 0; attempt < 3 && isBlankCanvas(tile); attempt++) {
+    await settleDelay();
+    tile = captureFrame(video, maxLongSide, rotation);
+  }
+  let sig = probeSignature(tile);
+  for (let attempt = 0; attempt < 3; attempt++) {
+    await settleDelay(40);
+    const next = captureFrame(video, maxLongSide, rotation);
+    const nextSig = probeSignature(next);
+    const settled = signatureDiff(sig, nextSig) < 1;
+    tile = next;
+    sig = nextSig;
+    if (settled) break;
+  }
+  return tile;
 }

@@ -34,11 +34,9 @@ import {
 import { detectEvents, SwingDetectionError, wristTrack } from "./core/events";
 import { createLandmarker, firstPose, type ModelName } from "./pose/landmarker";
 import {
-  captureFrame,
+  captureSettledFrame,
   drawRotatedFrame,
-  isBlankCanvas,
   sampleAtTimes,
-  settleDelay,
   type Rotation,
 } from "./video/decode";
 
@@ -292,13 +290,7 @@ export async function analyzeSwing(
       () => order.map((name) => eventTimes[name]),
       async ({ video, timeSec, index }) => {
         const name = order[index];
-        let tile = captureFrame(video, maxTileSize, rotate);
-        // iOS Safari can still hand over a black frame right after a seek.
-        // A blank capture is detectable, so retry it rather than display it.
-        for (let attempt = 0; attempt < 3 && isBlankCanvas(tile); attempt++) {
-          await settleDelay();
-          tile = captureFrame(video, maxTileSize, rotate);
-        }
+        const tile = await captureSettledFrame(video, maxTileSize, rotate);
         tiles[name] = tile;
         // Pose the tile rather than the video: angles are scale-invariant, and
         // this way the overlay is already in the tile's coordinates.
