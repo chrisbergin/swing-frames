@@ -13,6 +13,7 @@ import { biggestGaps, overallScore, type Similarity } from "./core/angles";
 import { EVENTS, type EventName, type Pose } from "./core/constants";
 import { analyzeSwing, compareAnalyses, type SwingAnalysis } from "./pipeline";
 import type { ModelName } from "./pose/landmarker";
+import { golferCrop, type CropRect } from "./ui/crop";
 import { drawPose } from "./ui/draw";
 import type { Rotation } from "./video/decode";
 
@@ -38,29 +39,72 @@ const MODEL_LABELS: Record<ModelName, string> = {
 
 const label = (name: EventName) => name.replace(/_/g, " ");
 
-/** One extracted frame with its skeleton drawn on. */
+/** Rendered height of an aligned (cropped) tile, in canvas pixels. */
+const ALIGNED_TILE_HEIGHT = 720;
+
+/** One extracted frame with its skeleton drawn on, optionally cropped so the
+ * golfer sits at a standard size and position. */
 function FrameTile({
   tile,
   pose,
   caption,
+  crop,
 }: {
   tile: HTMLCanvasElement | null;
   pose: Pose | null;
   caption?: string;
+  crop?: CropRect | null;
 }) {
   const ref = useRef<HTMLCanvasElement>(null);
 
   useEffect(() => {
     const canvas = ref.current;
     if (!canvas || !tile) return;
-    canvas.width = tile.width;
-    canvas.height = tile.height;
-    const ctx = canvas.getContext("2d");
-    if (!ctx) return;
-    ctx.drawImage(tile, 0, 0);
-    // Poses are measured off the tile, so they are already in its coordinates.
-    if (pose) drawPose(ctx, pose, 1);
-  }, [tile, pose]);
+    const ctx0 = canvas.getContext("2d");
+    if (!ctx0) return;
+    const ctx = ctx0;
+
+    if (!crop) {
+      canvas.width = tile.width;
+      canvas.height = tile.height;
+      ctx.drawImage(tile, 0, 0);
+      // Poses are measured off the tile, so they are already in its coordinates.
+      if (pose) drawPose(ctx, pose, 1);
+      return;
+    }
+
+    const scale = ALIGNED_TILE_HEIGHT / crop.sh;
+    canvas.width = Math.round(crop.sw * scale);
+    canvas.height = ALIGNED_TILE_HEIGHT;
+    ctx.fillStyle = "#000";
+    ctx.fillRect(0, 0, canvas.width, canvas.height);
+
+    // The crop may reach past the frame; draw the part that exists and leave
+    // the overhang black, so the alignment never bends near an edge.
+    const ox = Math.max(crop.sx, 0);
+    const oy = Math.max(crop.sy, 0);
+    const ox2 = Math.min(crop.sx + crop.sw, tile.width);
+    const oy2 = Math.min(crop.sy + crop.sh, tile.height);
+    if (ox2 > ox && oy2 > oy) {
+      ctx.drawImage(
+        tile,
+        ox,
+        oy,
+        ox2 - ox,
+        oy2 - oy,
+        (ox - crop.sx) * scale,
+        (oy - crop.sy) * scale,
+        (ox2 - ox) * scale,
+        (oy2 - oy) * scale,
+      );
+    }
+    if (pose) {
+      ctx.save();
+      ctx.setTransform(scale, 0, 0, scale, -crop.sx * scale, -crop.sy * scale);
+      drawPose(ctx, pose, 1);
+      ctx.restore();
+    }
+  }, [tile, pose, crop]);
 
   return (
     <div className="tile">
@@ -133,14 +177,27 @@ function PositionDetail({
   name,
   results,
   onStep,
+  align,
+  onAlign,
 }: {
   name: EventName;
   results: Results;
   onStep: (delta: number) => void;
+  align: boolean;
+  onAlign: (value: boolean) => void;
 }) {
   const { yours, pro, similarity } = results;
   const position = similarity?.[name] ?? null;
   const touch = useRef<{ x: number; y: number } | null>(null);
+
+  const cropFor = (analysis: SwingAnalysis): CropRect | null => {
+    const pose = analysis.eventPoses[name];
+    const tile = analysis.tiles[name];
+    if (!align || !pose || !tile) return null;
+    return golferCrop(pose, tile.height);
+  };
+  const yoursCrop = cropFor(yours);
+  const proCrop = pro ? cropFor(pro) : null;
 
   return (
     <section
@@ -190,16 +247,27 @@ function PositionDetail({
         <FrameTile
           tile={yours.tiles[name]}
           pose={yours.eventPoses[name]}
+          crop={yoursCrop}
           caption={`you · ${yours.eventTimes[name].toFixed(2)}s`}
         />
         {pro && (
           <FrameTile
             tile={pro.tiles[name]}
             pose={pro.eventPoses[name]}
+            crop={proCrop}
             caption={`reference · ${pro.eventTimes[name].toFixed(2)}s`}
           />
         )}
       </div>
+
+      <label className="align-toggle">
+        <input
+          type="checkbox"
+          checked={align}
+          onChange={(e) => onAlign(e.target.checked)}
+        />
+        align golfers (crop both to the same body size, feet on the same line)
+      </label>
 
       {position && (
         <p className="gaps">
@@ -292,6 +360,7 @@ export default function App() {
   const [error, setError] = useState("");
   const [results, setResults] = useState<Results | null>(null);
   const [selected, setSelected] = useState<EventName>("impact");
+  const [align, setAlign] = useState(true);
   const detailRef = useRef<HTMLDivElement>(null);
 
   const step = useCallback((delta: number) => {
@@ -466,7 +535,13 @@ export default function App() {
             }}
           />
           <div ref={detailRef}>
-            <PositionDetail name={selected} results={results} onStep={step} />
+            <PositionDetail
+              name={selected}
+              results={results}
+              onStep={step}
+              align={align}
+              onAlign={setAlign}
+            />
           </div>
 
           <details className="diagnostics">

@@ -325,6 +325,16 @@ button:disabled {
   font-variant-numeric: tabular-nums;
 }
 
+.align-toggle {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-top: 10px;
+  font-size: 0.8rem;
+  opacity: 0.75;
+  cursor: pointer;
+}
+
 .diagnostics {
   margin-top: 24px;
   padding: 12px 16px;
