@@ -1,75 +1,13 @@
 /**
- * Sequential frame decoding from a local video file.
+ * Frame access for a local video file.
  *
- * The project's hardest-won gotcha applies here with more force than it did in
- * Python: **decode sequentially, never seek.** `cv2 CAP_PROP_POS_FRAMES` was
- * off by 2-3 frames on iPhone HEVC and sent an earlier debugging session down a
- * false trail; browser seeking is at least as unreliable. So frames are walked
- * in presentation order with requestVideoFrameCallback and never addressed by
- * index.
- *
- * The cost of that choice is that decoding runs at playback speed, and if the
- * per-frame callback is slower than the frame interval the browser presents
- * fewer frames than the clip contains. That is detectable rather than silent:
- * rVFC reports `presentedFrames`, so gaps are counted and reported back. If
- * drops turn out to matter on device, the fix is WebCodecs (deterministic
- * decode, no timing coupling) at the cost of bundling an MP4 demuxer.
+ * Frames are fetched by seeking (`sampleAtTimes`), never by playing the clip:
+ * requestVideoFrameCallback only fires during playback, so walking a clip costs
+ * its full running time however few frames are wanted from it. The project's
+ * standing "never seek" rule is about frame *numbers*: every seek here reports
+ * the time it actually landed on, and nothing depends on hitting an exact
+ * frame.
  */
-
-/** Per-frame metadata from requestVideoFrameCallback, narrowed to what we use. */
-interface FrameMetadata {
-  mediaTime: number;
-  presentedFrames: number;
-}
-
-export interface WalkOptions {
-  /**
-   * Playback speed during the walk. Below 1 buys more wall-clock time per
-   * frame for slow work, which is the lever for avoiding dropped frames.
-   */
-  playbackRate?: number;
-  /**
-   * Called once the video's duration and size are known, before any frame is
-   * handed over, so the caller can plan how densely to sample.
-   */
-  onMetadata?: (info: { durationSec: number; width: number; height: number }) => void;
-  signal?: AbortSignal;
-}
-
-export interface WalkResult {
-  width: number;
-  height: number;
-  durationSec: number;
-  /** Frames actually handed to the callback. */
-  frameCount: number;
-  /** Frames the browser decoded but never presented to us. */
-  droppedFrames: number;
-  /** Derived from frame timestamps: the container does not expose a frame rate. */
-  fps: number;
-}
-
-/**
- * Estimate frame rate from presentation timestamps.
- *
- * There is no browser equivalent of cv2's CAP_PROP_FPS, so it comes from the
- * frames themselves. The median interval is used rather than the mean because
- * a single long gap, from a dropped frame or a variable-frame-rate clip, would
- * drag the mean and quietly distort every frame-rate-derived window.
- */
-export function estimateFps(mediaTimesSec: readonly number[]): number {
-  if (mediaTimesSec.length < 2) return 30;
-  const deltas: number[] = [];
-  for (let i = 1; i < mediaTimesSec.length; i++) {
-    const d = mediaTimesSec[i] - mediaTimesSec[i - 1];
-    if (d > 0) deltas.push(d);
-  }
-  if (deltas.length === 0) return 30;
-  deltas.sort((a, b) => a - b);
-  const mid = Math.floor(deltas.length / 2);
-  const median =
-    deltas.length % 2 === 0 ? (deltas[mid - 1] + deltas[mid]) / 2 : deltas[mid];
-  return median > 0 ? 1 / median : 30;
-}
 
 /**
  * Scale factor that fits an image inside `maxLongSide` without enlarging it.
@@ -86,16 +24,6 @@ export function fitScale(
   const longSide = Math.max(width, height);
   if (longSide <= maxLongSide) return 1;
   return maxLongSide / longSide;
-}
-
-/** Count frames the browser decoded but skipped past, from rVFC's counter. */
-export function countDrops(presentedFrames: readonly number[]): number {
-  let dropped = 0;
-  for (let i = 1; i < presentedFrames.length; i++) {
-    const gap = presentedFrames[i] - presentedFrames[i - 1];
-    if (gap > 1) dropped += gap - 1;
-  }
-  return dropped;
 }
 
 function once(target: EventTarget, event: string, signal?: AbortSignal): Promise<void> {
@@ -162,106 +90,6 @@ export async function loadVideo(
     throw err;
   }
   return { video, release };
-}
-
-/**
- * Walk every presented frame of a video in order, calling `onFrame` for each.
- *
- * `onFrame` runs synchronously so it finishes before the next frame is
- * presented; anything slow enough to overrun the frame interval shows up as
- * dropped frames in the result rather than as silently missing data.
- */
-export async function walkVideoFrames(
-  file: Blob,
-  onFrame: (video: HTMLVideoElement, index: number, mediaTimeSec: number) => void,
-  { playbackRate = 1, onMetadata, signal }: WalkOptions = {},
-): Promise<WalkResult> {
-  const { video, release } = await loadVideo(file, signal);
-
-  try {
-    onMetadata?.({
-      durationSec: video.duration,
-      width: video.videoWidth,
-      height: video.videoHeight,
-    });
-
-    if (!("requestVideoFrameCallback" in video)) {
-      throw new Error(
-        "This browser cannot step through video frames " +
-          "(requestVideoFrameCallback is unavailable). Try Safari or Chrome.",
-      );
-    }
-
-    const mediaTimes: number[] = [];
-    const presented: number[] = [];
-    let index = 0;
-
-    video.playbackRate = playbackRate;
-
-    await new Promise<void>((resolve, reject) => {
-      const onAbort = () => {
-        video.pause();
-        reject(new Error("Cancelled."));
-      };
-      signal?.addEventListener("abort", onAbort, { once: true });
-
-      /**
-       * Resume playback. Pausing on the next frame can abort a still-pending
-       * play(), which is expected here rather than a failure, so only real
-       * errors are surfaced.
-       */
-      const resume = () => {
-        video.play().catch((err: unknown) => {
-          if (err instanceof Error && err.name === "AbortError") return;
-          reject(err);
-        });
-      };
-
-      const step = (_now: number, metadata: FrameMetadata) => {
-        if (signal?.aborted) return;
-        // Stop the media clock before doing any work. Pose detection takes far
-        // longer than a frame interval, and playback does not wait: left
-        // running, the browser presents frames we never get a callback for and
-        // they are simply lost. Measured on a 27fps clip, that dropped 36 of
-        // 57 frames, which then misread the frame rate as 15fps and put every
-        // position in the wrong place.
-        video.pause();
-        try {
-          mediaTimes.push(metadata.mediaTime);
-          presented.push(metadata.presentedFrames);
-          onFrame(video, index, metadata.mediaTime);
-          index++;
-        } catch (err) {
-          reject(err);
-          return;
-        }
-        // Queue the next callback before resuming, so the frame that play()
-        // presents cannot arrive before anything is listening for it.
-        video.requestVideoFrameCallback(step);
-        resume();
-      };
-
-      video.requestVideoFrameCallback(step);
-      video.addEventListener("ended", () => resolve(), { once: true });
-      video.addEventListener(
-        "error",
-        () => reject(new Error("Video playback failed.")),
-        { once: true },
-      );
-      resume();
-    });
-
-    return {
-      width: video.videoWidth,
-      height: video.videoHeight,
-      durationSec: video.duration,
-      frameCount: index,
-      droppedFrames: countDrops(presented),
-      fps: estimateFps(mediaTimes),
-    };
-  } finally {
-    release();
-  }
 }
 
 /** How long to wait on a single seek before giving up and using what is there. */
@@ -359,6 +187,57 @@ export async function sampleAtTimes(
 }
 
 /**
+ * Clockwise rotation applied to every frame before it is used.
+ *
+ * The port of the Python's --rotate. Phone videos carry rotation metadata the
+ * browser honours, so this exists for clips without it: screen recordings and
+ * some downloads, which otherwise decode sideways and pose as "no golfer".
+ */
+export type Rotation = 0 | 90 | 180 | 270;
+
+/** Canvas size holding a `width` x `height` frame after rotation and scaling. */
+export function rotatedSize(
+  width: number,
+  height: number,
+  rotation: Rotation,
+  scale = 1,
+): { width: number; height: number } {
+  const w = Math.round(width * scale);
+  const h = Math.round(height * scale);
+  const swapped = rotation === 90 || rotation === 270;
+  return { width: swapped ? h : w, height: swapped ? w : h };
+}
+
+/** Draw the video's current frame into `canvas`, rotated clockwise and scaled. */
+export function drawRotatedFrame(
+  canvas: HTMLCanvasElement,
+  video: HTMLVideoElement,
+  rotation: Rotation,
+  scale = 1,
+): void {
+  const w = Math.round(video.videoWidth * scale);
+  const h = Math.round(video.videoHeight * scale);
+  const size = rotatedSize(video.videoWidth, video.videoHeight, rotation, scale);
+  canvas.width = size.width;
+  canvas.height = size.height;
+  const ctx = canvas.getContext("2d");
+  if (!ctx) throw new Error("Could not get a 2D canvas context.");
+  ctx.save();
+  if (rotation === 90) {
+    ctx.translate(canvas.width, 0);
+    ctx.rotate(Math.PI / 2);
+  } else if (rotation === 180) {
+    ctx.translate(canvas.width, canvas.height);
+    ctx.rotate(Math.PI);
+  } else if (rotation === 270) {
+    ctx.translate(0, canvas.height);
+    ctx.rotate(-Math.PI / 2);
+  }
+  ctx.drawImage(video, 0, 0, w, h);
+  ctx.restore();
+}
+
+/**
  * Copy the video's current frame into a new canvas, scaled to fit.
  *
  * Each retained frame gets its own canvas so it survives after playback has
@@ -368,13 +247,10 @@ export async function sampleAtTimes(
 export function captureFrame(
   video: HTMLVideoElement,
   maxLongSide: number,
+  rotation: Rotation = 0,
 ): HTMLCanvasElement {
   const scale = fitScale(video.videoWidth, video.videoHeight, maxLongSide);
   const canvas = document.createElement("canvas");
-  canvas.width = Math.round(video.videoWidth * scale);
-  canvas.height = Math.round(video.videoHeight * scale);
-  const ctx = canvas.getContext("2d");
-  if (!ctx) throw new Error("Could not get a 2D canvas context.");
-  ctx.drawImage(video, 0, 0, canvas.width, canvas.height);
+  drawRotatedFrame(canvas, video, rotation, scale);
   return canvas;
 }

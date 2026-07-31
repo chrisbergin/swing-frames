@@ -199,7 +199,7 @@ describe("wristTrack", () => {
       i < 8 ? wristPose(100) : null,
     );
     expect(() => wristTrack(poses, 30)).toThrow(SwingDetectionError);
-    expect(() => wristTrack(poses, 30)).toThrow(/8\/20 frames/);
+    expect(() => wristTrack(poses, 30)).toThrow(/only 8 of 20 sampled frames/);
   });
 });
 

@@ -280,7 +280,14 @@ def joint_angles(pts):
     def ang(a, b, c):
         v1 = np.array(pts[a]) - np.array(pts[b])
         v2 = np.array(pts[c]) - np.array(pts[b])
-        cos = np.dot(v1, v2) / (np.linalg.norm(v1) * np.linalg.norm(v2) + 1e-9)
+        n1, n2 = np.linalg.norm(v1), np.linalg.norm(v2)
+        # Coincident landmarks have no defined angle; 90 matches what the old
+        # epsilon denominator produced. An epsilon in the normal path sits
+        # where acos is steepest, so a straight limb measured 179.99991 and
+        # scale invariance broke at 1e-4 degrees. Matches angles.ts.
+        if n1 == 0 or n2 == 0:
+            return 90.0
+        cos = np.dot(v1, v2) / (n1 * n2)
         return float(np.degrees(np.arccos(np.clip(cos, -1.0, 1.0))))
 
     angles = {

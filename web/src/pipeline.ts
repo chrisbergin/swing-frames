@@ -33,7 +33,12 @@ import {
 } from "./core/constants";
 import { detectEvents, SwingDetectionError, wristTrack } from "./core/events";
 import { createLandmarker, firstPose, type ModelName } from "./pose/landmarker";
-import { captureFrame, sampleAtTimes } from "./video/decode";
+import {
+  captureFrame,
+  drawRotatedFrame,
+  sampleAtTimes,
+  type Rotation,
+} from "./video/decode";
 
 export interface AnalyzeProgress {
   phase: "tracking" | "refining" | "extracting";
@@ -43,6 +48,8 @@ export interface AnalyzeProgress {
 
 export interface AnalyzeOptions {
   model?: ModelName;
+  /** Clockwise rotation for clips without rotation metadata. */
+  rotate?: Rotation;
   /** Long-side cap for retained frames. Tiles are displayed small anyway. */
   maxTileSize?: number;
   /** Fixed pose count for the first pass. Defaults to scaling with duration. */
@@ -57,6 +64,9 @@ export interface SwingAnalysis {
   height: number;
   /** How many pose detections the whole analysis ran. */
   posesRun: number;
+  /** How many of those found a person. Low against posesRun means the golfer
+   * was not visible: cropped, tiny, sideways, or absent. */
+  posesFound: number;
   /**
    * When each position happens, in seconds.
    *
@@ -151,6 +161,7 @@ export async function analyzeSwing(
   file: Blob,
   {
     model = "full",
+    rotate = 0,
     maxTileSize = 720,
     coarseSamples,
     onProgress,
@@ -159,6 +170,27 @@ export async function analyzeSwing(
 ): Promise<SwingAnalysis> {
   const landmarker = await createLandmarker("IMAGE", { model });
   let posesRun = 0;
+  let posesFound = 0;
+
+  // With a rotation set, detection runs on this scratch canvas instead of the
+  // video element. Reuse is safe: MediaPipe reads it synchronously.
+  const scratch = rotate === 0 ? null : document.createElement("canvas");
+  const detectCurrentFrame = (video: HTMLVideoElement): Pose | null => {
+    let pose: Pose | null;
+    if (scratch) {
+      drawRotatedFrame(scratch, video, rotate);
+      pose = firstPose(landmarker.detect(scratch), scratch.width, scratch.height);
+    } else {
+      pose = firstPose(
+        landmarker.detect(video),
+        video.videoWidth,
+        video.videoHeight,
+      );
+    }
+    posesRun++;
+    if (pose) posesFound++;
+    return pose;
+  };
 
   try {
     // 1. Coarse pass: the shape of the swing.
@@ -173,13 +205,7 @@ export async function analyzeSwing(
         return planSampleTimes(durationSec, samples);
       },
       ({ video, timeSec }) => {
-        const pose = firstPose(
-          landmarker.detect(video),
-          video.videoWidth,
-          video.videoHeight,
-        );
-        posesRun++;
-        coarsePoses.push(pose);
+        coarsePoses.push(detectCurrentFrame(video));
         coarseTimes.push(timeSec);
         onProgress?.({
           phase: "tracking",
@@ -222,13 +248,7 @@ export async function analyzeSwing(
             durationSec,
           ),
         ({ video, timeSec }) => {
-          const pose = firstPose(
-            landmarker.detect(video),
-            video.videoWidth,
-            video.videoHeight,
-          );
-          posesRun++;
-          const y = wristHeight(pose);
+          const y = wristHeight(detectCurrentFrame(video));
           if (!Number.isNaN(y)) measured.push({ time: timeSec, y });
           onProgress?.({
             phase: "refining",
@@ -265,16 +285,14 @@ export async function analyzeSwing(
       () => order.map((name) => eventTimes[name]),
       ({ video, timeSec, index }) => {
         const name = order[index];
-        const tile = captureFrame(video, maxTileSize);
+        const tile = captureFrame(video, maxTileSize, rotate);
         tiles[name] = tile;
         // Pose the tile rather than the video: angles are scale-invariant, and
         // this way the overlay is already in the tile's coordinates.
-        eventPoses[name] = firstPose(
-          landmarker.detect(tile),
-          tile.width,
-          tile.height,
-        );
+        const pose = firstPose(landmarker.detect(tile), tile.width, tile.height);
+        eventPoses[name] = pose;
         posesRun++;
+        if (pose) posesFound++;
         eventTimes[name] = timeSec;
         onProgress?.({
           phase: "extracting",
@@ -290,6 +308,7 @@ export async function analyzeSwing(
       width: meta.width,
       height: meta.height,
       posesRun,
+      posesFound,
       eventTimes,
       eventPoses,
       tiles,

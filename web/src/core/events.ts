@@ -134,9 +134,12 @@ export function wristTrack(
 
   if (validCount < Math.max(10, n * 0.5)) {
     throw new SwingDetectionError(
-      `Pose detected in only ${validCount}/${n} frames. Check that the golfer ` +
-        `is fully in frame (try rotating the video if it looks sideways, or ` +
-        `the heavy model).`,
+      `Found a golfer in only ${validCount} of ${n} sampled frames. Usual ` +
+        `causes, most likely first: the golfer is partly out of frame (head ` +
+        `or feet cropped), the clip is very low resolution (screen recordings ` +
+        `especially; prefer a full-resolution download), or the video decodes ` +
+        `sideways (set Rotation). The Heavy model sometimes helps borderline ` +
+        `clips.`,
     );
   }
 

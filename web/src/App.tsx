@@ -14,6 +14,14 @@ import { EVENTS, type EventName, type Pose } from "./core/constants";
 import { analyzeSwing, compareAnalyses, type SwingAnalysis } from "./pipeline";
 import type { ModelName } from "./pose/landmarker";
 import { drawPose } from "./ui/draw";
+import type { Rotation } from "./video/decode";
+
+const ROTATIONS: Array<[Rotation, string]> = [
+  [0, "no rotation"],
+  [90, "rotate 90° right"],
+  [180, "rotate 180°"],
+  [270, "rotate 90° left"],
+];
 
 interface Results {
   yours: SwingAnalysis;
@@ -175,14 +183,69 @@ function Diagnostics({
   return (
     <li>
       <strong>{text}:</strong> {analysis.durationSec.toFixed(1)}s,{" "}
-      {analysis.width}&times;{analysis.height}, {analysis.posesRun} poses
+      {analysis.width}&times;{analysis.height}, golfer found in{" "}
+      {analysis.posesFound} of {analysis.posesRun} detections
     </li>
+  );
+}
+
+/** File picker plus the rotation override for clips that decode sideways. */
+function ClipPicker({
+  label: text,
+  optional,
+  file,
+  onFile,
+  rotate,
+  onRotate,
+  disabled,
+}: {
+  label: string;
+  optional?: boolean;
+  file: File | null;
+  onFile: (file: File | null) => void;
+  rotate: Rotation;
+  onRotate: (rotation: Rotation) => void;
+  disabled: boolean;
+}) {
+  return (
+    <div className="picker-group">
+      <label className="picker">
+        <span className="picker-label">
+          {text} {optional && <em>optional</em>}
+        </span>
+        <input
+          type="file"
+          accept="video/*"
+          disabled={disabled}
+          onChange={(e) => onFile(e.target.files?.[0] ?? null)}
+        />
+        <span className="filename">{file?.name ?? "no video chosen"}</span>
+      </label>
+      {file && (
+        <label className="picker">
+          <span className="picker-label">Rotation</span>
+          <select
+            value={rotate}
+            disabled={disabled}
+            onChange={(e) => onRotate(Number(e.target.value) as Rotation)}
+          >
+            {ROTATIONS.map(([value, text]) => (
+              <option key={value} value={value}>
+                {text}
+              </option>
+            ))}
+          </select>
+        </label>
+      )}
+    </div>
   );
 }
 
 export default function App() {
   const [yourFile, setYourFile] = useState<File | null>(null);
   const [proFile, setProFile] = useState<File | null>(null);
+  const [yourRotate, setYourRotate] = useState<Rotation>(0);
+  const [proRotate, setProRotate] = useState<Rotation>(0);
   const [model, setModel] = useState<ModelName>("full");
   const [busy, setBusy] = useState(false);
   const [status, setStatus] = useState("");
@@ -198,22 +261,33 @@ export default function App() {
     const startedAt = performance.now();
 
     try {
-      const analyse = (file: File, name: string) =>
-        analyzeSwing(file, {
-          model,
-          onProgress: ({ phase, done, total }) => {
-            const verb =
-              phase === "tracking"
-                ? "Tracking"
-                : phase === "refining"
-                  ? "Pinning down impact in"
-                  : "Grabbing frames from";
-            setStatus(`${verb} ${name}: ${done}/${total}`);
-          },
-        });
+      // A failure must say which clip it came from: with two clips in play,
+      // an unattributed error leaves the wrong one getting re-shot.
+      const analyse = async (file: File, name: string, rotate: Rotation) => {
+        try {
+          return await analyzeSwing(file, {
+            model,
+            rotate,
+            onProgress: ({ phase, done, total }) => {
+              const verb =
+                phase === "tracking"
+                  ? "Tracking"
+                  : phase === "refining"
+                    ? "Pinning down impact in"
+                    : "Grabbing frames from";
+              setStatus(`${verb} ${name}: ${done}/${total}`);
+            },
+          });
+        } catch (err) {
+          const msg = err instanceof Error ? err.message : String(err);
+          throw new Error(`Problem with ${name}: ${msg}`);
+        }
+      };
 
-      const yours = await analyse(yourFile, "your swing");
-      const pro = proFile ? await analyse(proFile, "the reference") : null;
+      const yours = await analyse(yourFile, "your swing", yourRotate);
+      const pro = proFile
+        ? await analyse(proFile, "the reference", proRotate)
+        : null;
 
       setSelected("impact");
       setResults({
@@ -243,29 +317,24 @@ export default function App() {
       </header>
 
       <div className="controls">
-        <label className="picker">
-          <span className="picker-label">Your swing</span>
-          <input
-            type="file"
-            accept="video/*"
-            disabled={busy}
-            onChange={(e) => setYourFile(e.target.files?.[0] ?? null)}
-          />
-          <span className="filename">{yourFile?.name ?? "no video chosen"}</span>
-        </label>
+        <ClipPicker
+          label="Your swing"
+          file={yourFile}
+          onFile={setYourFile}
+          rotate={yourRotate}
+          onRotate={setYourRotate}
+          disabled={busy}
+        />
 
-        <label className="picker">
-          <span className="picker-label">
-            Reference swing <em>optional</em>
-          </span>
-          <input
-            type="file"
-            accept="video/*"
-            disabled={busy}
-            onChange={(e) => setProFile(e.target.files?.[0] ?? null)}
-          />
-          <span className="filename">{proFile?.name ?? "no video chosen"}</span>
-        </label>
+        <ClipPicker
+          label="Reference swing"
+          optional
+          file={proFile}
+          onFile={setProFile}
+          rotate={proRotate}
+          onRotate={setProRotate}
+          disabled={busy}
+        />
 
         <label className="picker">
           <span className="picker-label">Model</span>
@@ -290,11 +359,29 @@ export default function App() {
         {error && <p className="error">{error}</p>}
       </div>
 
-      <p className="tip">
-        Trim the clip to a single swing, starting at address: a clip that opens
-        mid-motion gets read as starting at the top of the backswing. Compare
-        like camera angle with like.
-      </p>
+      <details className="tip">
+        <summary>What makes a clip work</summary>
+        <ul>
+          <li>
+            <strong>Whole golfer in frame</strong>, head to feet, the entire
+            swing. A cropped or heavily zoomed clip finds no golfer at all.
+          </li>
+          <li>
+            <strong>Trimmed to a single swing, starting at address.</strong> A
+            clip that opens mid-motion gets read as starting at the top of the
+            backswing.
+          </li>
+          <li>
+            <strong>Decent resolution.</strong> A screen recording of someone
+            else's video is often too small; prefer a full-resolution download.
+          </li>
+          <li>
+            <strong>Same camera angle on both clips</strong> (down-the-line
+            with down-the-line, face-on with face-on), or the similarity score
+            means nothing.
+          </li>
+        </ul>
+      </details>
 
       {results && (
         <>
@@ -329,9 +416,9 @@ export default function App() {
               )}
             </ul>
             <p className="diagnostics-note">
-              Dropped frames mean the browser played past frames faster than
-              they could be analysed. A few are harmless, since the wrist track
-              interpolates gaps, but many will move the impact frame.
+              "Golfer found" well below the detections run means the pose model
+              could not see a person in much of the clip: usually cropped
+              framing, low resolution, or a sideways video.
             </p>
           </details>
         </>

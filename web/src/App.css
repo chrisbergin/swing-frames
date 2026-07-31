@@ -19,6 +19,12 @@
   border-radius: 12px;
 }
 
+.picker-group {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+
 .picker {
   display: flex;
   flex-direction: column;
@@ -93,6 +99,18 @@ button:disabled {
 .tip {
   opacity: 0.75;
   margin-bottom: 20px;
+}
+
+.tip summary {
+  cursor: pointer;
+  font-weight: 600;
+}
+
+.tip ul {
+  margin: 8px 0 0;
+  padding-left: 18px;
+  display: grid;
+  gap: 6px;
 }
 
 .overall {

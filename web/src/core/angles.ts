@@ -51,12 +51,11 @@ function angleAt(pts: Pose, a: number, b: number, c: number): number {
   const v2 = { x: pts[c].x - pts[b].x, y: pts[c].y - pts[b].y };
   const n1 = Math.hypot(v1.x, v1.y);
   const n2 = Math.hypot(v2.x, v2.y);
-  // Coincident landmarks have no defined angle. The Python guards this with
-  // an epsilon added to the denominator, which lands on exactly 90 here; keep
-  // that result but leave the epsilon out of the normal path, where it shifts
-  // the cosine just enough to matter at acos's steepest point (a straight limb
-  // measured 179.99991 rather than 180, and scale invariance broke at 1e-4 deg).
-  // The gap versus Python is far below the 0.1 deg the results are reported at.
+  // Coincident landmarks have no defined angle; 90 is the answer the Python's
+  // old epsilon denominator produced, and both sides now use this explicit
+  // guard. An epsilon in the normal path sits where acos is steepest, so a
+  // straight limb measured 179.99991 rather than 180 and scale invariance
+  // broke at 1e-4 degrees.
   if (n1 === 0 || n2 === 0) return 90;
   const cos = (v1.x * v2.x + v1.y * v2.y) / (n1 * n2);
   return Math.acos(Math.min(1, Math.max(-1, cos))) * DEG;
