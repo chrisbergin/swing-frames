@@ -326,7 +326,11 @@ export async function analyzeSwing(
         eventPoses[name] = pose;
         posesRun++;
         if (pose) posesFound++;
-        eventTimes[name] = timeSec;
+        // The nudge that repaints the frame advances currentTime by about a
+        // frame, so report where it actually landed, not the pre-nudge seek.
+        eventTimes[name] = Number.isFinite(video.currentTime)
+          ? video.currentTime
+          : timeSec;
         onProgress?.({
           phase: "extracting",
           done: index + 1,

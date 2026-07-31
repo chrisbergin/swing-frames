@@ -326,6 +326,38 @@ export interface CapturedFrame {
 }
 
 /**
+ * Force the video to actually present the frame at its current time.
+ *
+ * A detached, paused <video> that has been seeked can keep its surface on the
+ * previous frame indefinitely on iOS Safari: re-reading the canvas just copies
+ * the same stale pixels. Playing advances the decode pipeline and paints a
+ * real frame (requestVideoFrameCallback fires for a detached element only
+ * while it plays), so a one-frame nudge repaints the surface. currentTime
+ * moves forward by about a frame, which is within tolerance for a still.
+ *
+ * Falls back to a plain wait where requestVideoFrameCallback is unavailable.
+ */
+export async function presentCurrentFrame(video: HTMLVideoElement): Promise<void> {
+  if (!("requestVideoFrameCallback" in video)) {
+    await settleDelay(60);
+    return;
+  }
+  await new Promise<void>((resolve) => {
+    let done = false;
+    const finish = () => {
+      if (done) return;
+      done = true;
+      video.pause();
+      resolve();
+    };
+    video.requestVideoFrameCallback(() => finish());
+    // A refused autoplay just means no nudge; the timeout still resolves.
+    void video.play().catch(() => finish());
+    setTimeout(finish, 250);
+  });
+}
+
+/**
  * Two signatures far enough apart to be genuinely different frames.
  *
  * Mean absolute luminance (0-255) per 8x8 cell. Real swing motion between two
@@ -334,10 +366,8 @@ export interface CapturedFrame {
  */
 const CHANGE_THRESHOLD = 3;
 
-/** How long to wait between re-reads while a stale surface catches up. */
-const FRESH_RETRY_MS = 50;
 /** Give a stale surface this many tries to present the sought frame. */
-const FRESH_ATTEMPTS = 8;
+const FRESH_ATTEMPTS = 6;
 
 /**
  * Capture the frame the video has actually seeked to, not a stale one.
@@ -363,6 +393,9 @@ export async function captureFreshFrame(
   rotation: Rotation = 0,
   previous?: readonly number[] | null,
 ): Promise<CapturedFrame> {
+  // Nudge once up front so the seeked frame is actually painted, not the one
+  // the surface was left on before the seek.
+  await presentCurrentFrame(video);
   let canvas = captureFrame(video, maxLongSide, rotation);
   let signature = probeSignature(canvas);
 
@@ -371,7 +404,9 @@ export async function captureFreshFrame(
     const stale =
       previous != null && signatureDiff(signature, previous) < CHANGE_THRESHOLD;
     if (!blank && !stale) break;
-    await settleDelay(FRESH_RETRY_MS);
+    // Still stale: force another presentation rather than just re-reading the
+    // same unchanged surface.
+    await presentCurrentFrame(video);
     canvas = captureFrame(video, maxLongSide, rotation);
     signature = probeSignature(canvas);
   }
