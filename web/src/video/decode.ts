@@ -121,40 +121,6 @@ export function settleDelay(ms = 200): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
-/** Coarse 8x8 luminance signature of a canvas, for cheap comparisons. */
-export function probeSignature(canvas: HTMLCanvasElement): number[] {
-  const probe = document.createElement("canvas");
-  probe.width = 8;
-  probe.height = 8;
-  const ctx = probe.getContext("2d", { willReadFrequently: true });
-  if (!ctx) return [];
-  ctx.drawImage(canvas, 0, 0, 8, 8);
-  const { data } = ctx.getImageData(0, 0, 8, 8);
-  const sig: number[] = [];
-  for (let i = 0; i < data.length; i += 4) {
-    sig.push(0.299 * data[i] + 0.587 * data[i + 1] + 0.114 * data[i + 2]);
-  }
-  return sig;
-}
-
-/**
- * Whether a canvas holds (near-)nothing but black pixels.
- *
- * A real video frame always has some pixel above the threshold, even at night
- * at the range.
- */
-export function isBlankCanvas(canvas: HTMLCanvasElement): boolean {
-  return probeSignature(canvas).every((v) => v <= 16);
-}
-
-/** Mean absolute difference between two probe signatures. */
-export function signatureDiff(a: readonly number[], b: readonly number[]): number {
-  if (a.length === 0 || a.length !== b.length) return Infinity;
-  let total = 0;
-  for (let i = 0; i < a.length; i++) total += Math.abs(a[i] - b[i]);
-  return total / a.length;
-}
-
 /** How long to wait on a single seek before giving up and using what is there. */
 const SEEK_TIMEOUT_MS = 3000;
 
@@ -318,97 +284,74 @@ export function captureFrame(
   return canvas;
 }
 
-/** A captured frame and its coarse signature, so callers can chain freshness
- * checks without re-probing. */
-export interface CapturedFrame {
-  canvas: HTMLCanvasElement;
-  signature: number[];
-}
+/** Seconds to back up before a target so playback can present it fresh. */
+const GRAB_PREROLL_SEC = 0.25;
+/** Cap on how long to play toward a target before giving up. */
+const GRAB_TIMEOUT_MS = 1500;
 
 /**
- * Force the video to actually present the frame at its current time.
+ * Capture the frame at `targetSec`, freshly presented and on the target frame.
  *
- * A detached, paused <video> that has been seeked can keep its surface on the
- * previous frame indefinitely on iOS Safari: re-reading the canvas just copies
- * the same stale pixels. Playing advances the decode pipeline and paints a
- * real frame (requestVideoFrameCallback fires for a detached element only
- * while it plays), so a one-frame nudge repaints the surface. currentTime
- * moves forward by about a frame, which is within tolerance for a still.
+ * Seeking a paused, detached <video> on iOS Safari updates its clock but can
+ * leave the surface on the frame it was already showing, so reading pixels
+ * gives a stale frame from wherever the video was before. Playback is the one
+ * thing that reliably repaints a detached element, and requestVideoFrameCallback
+ * reports each presented frame's time while it runs.
  *
- * Falls back to a plain wait where requestVideoFrameCallback is unavailable.
+ * So seek just *before* the target, play into it, and grab the first frame at
+ * or after the target time. Playing guarantees a fresh surface (fixes the
+ * stale frame); stopping at the target keeps it frame-accurate (a plain nudge
+ * would drift the clock forward, which was blunting impact). Lands within one
+ * frame of the target, on the at-or-after side, which matches how impact is
+ * defined anyway.
  */
-export async function presentCurrentFrame(video: HTMLVideoElement): Promise<void> {
-  if (!("requestVideoFrameCallback" in video)) {
-    await settleDelay(60);
-    return;
+export async function grabFrameAt(
+  video: HTMLVideoElement,
+  targetSec: number,
+  maxLongSide: number,
+  rotation: Rotation = 0,
+  signal?: AbortSignal,
+): Promise<HTMLCanvasElement> {
+  const target = Math.max(0, Math.min(targetSec, video.duration - 1e-3));
+  const from = Math.max(0, target - GRAB_PREROLL_SEC);
+  if (Math.abs(video.currentTime - from) > 1e-3) {
+    video.currentTime = from;
+    await onceWithTimeout(video, "seeked", SEEK_TIMEOUT_MS, signal);
   }
-  await new Promise<void>((resolve) => {
+
+  // Bind the per-frame callback via optional chaining: this narrows the
+  // function variable rather than the element, so the runtime fallback for a
+  // browser without it does not turn `video` into `never`.
+  const requestFrame = video.requestVideoFrameCallback?.bind(video);
+  if (!requestFrame) {
+    // No per-frame callback: seek straight to the target and wait a beat.
+    if (Math.abs(video.currentTime - target) > 1e-3) {
+      video.currentTime = target;
+      await onceWithTimeout(video, "seeked", SEEK_TIMEOUT_MS, signal);
+    }
+    await settleDelay(80);
+    return captureFrame(video, maxLongSide, rotation);
+  }
+
+  return await new Promise<HTMLCanvasElement>((resolve) => {
     let done = false;
-    const finish = () => {
+    const finishWith = (canvas: HTMLCanvasElement) => {
       if (done) return;
       done = true;
       video.pause();
-      resolve();
+      resolve(canvas);
     };
-    video.requestVideoFrameCallback(() => finish());
-    // A refused autoplay just means no nudge; the timeout still resolves.
-    void video.play().catch(() => finish());
-    setTimeout(finish, 250);
+    const grab = () => finishWith(captureFrame(video, maxLongSide, rotation));
+    const onFrame = (_now: number, meta: { mediaTime: number }) => {
+      if (done) return;
+      // First frame at or after the target is the one to keep.
+      if (meta.mediaTime >= target - 1e-3) grab();
+      else requestFrame(onFrame);
+    };
+    requestFrame(onFrame);
+    // A refused autoplay leaves the timeout to capture whatever is there.
+    void video.play().catch(grab);
+    signal?.addEventListener("abort", grab, { once: true });
+    setTimeout(grab, GRAB_TIMEOUT_MS);
   });
-}
-
-/**
- * Two signatures far enough apart to be genuinely different frames.
- *
- * Mean absolute luminance (0-255) per 8x8 cell. Real swing motion between two
- * distinct positions moves this by tens; sensor noise and compression jitter
- * on a truly identical frame stay well under this.
- */
-const CHANGE_THRESHOLD = 3;
-
-/** Give a stale surface this many tries to present the sought frame. */
-const FRESH_ATTEMPTS = 6;
-
-/**
- * Capture the frame the video has actually seeked to, not a stale one.
- *
- * The failure this fixes: on iOS Safari a seek updates currentTime and fires
- * "seeked", but the surface can keep showing the *previous* frame for a beat.
- * Detection still gets the right time (it reads landmarks, not pixels), yet
- * the displayed tile is a frame from wherever the video was before, so a
- * position looks stuck on an earlier one, differently each run.
- *
- * The tell is that the pixels have not changed from the previously captured
- * position, even though the seek moved somewhere visibly different. So when
- * the caller says this frame should differ from the last one, wait until the
- * capture actually differs (or the attempts run out, never hanging). Black
- * frames, a separate iOS quirk, are retried the same way.
- *
- * On desktop, where the surface is already correct, the first capture differs
- * immediately and this returns at once.
- */
-export async function captureFreshFrame(
-  video: HTMLVideoElement,
-  maxLongSide: number,
-  rotation: Rotation = 0,
-  previous?: readonly number[] | null,
-): Promise<CapturedFrame> {
-  // Nudge once up front so the seeked frame is actually painted, not the one
-  // the surface was left on before the seek.
-  await presentCurrentFrame(video);
-  let canvas = captureFrame(video, maxLongSide, rotation);
-  let signature = probeSignature(canvas);
-
-  for (let attempt = 0; attempt < FRESH_ATTEMPTS; attempt++) {
-    const blank = isBlankCanvas(canvas);
-    const stale =
-      previous != null && signatureDiff(signature, previous) < CHANGE_THRESHOLD;
-    if (!blank && !stale) break;
-    // Still stale: force another presentation rather than just re-reading the
-    // same unchanged surface.
-    await presentCurrentFrame(video);
-    canvas = captureFrame(video, maxLongSide, rotation);
-    signature = probeSignature(canvas);
-  }
-  return { canvas, signature };
 }

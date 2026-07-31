@@ -34,8 +34,9 @@ import {
 import { detectEvents, SwingDetectionError, wristTrack } from "./core/events";
 import { createLandmarker, firstPose, type ModelName } from "./pose/landmarker";
 import {
-  captureFreshFrame,
   drawRotatedFrame,
+  grabFrameAt,
+  loadVideo,
   sampleAtTimes,
   type Rotation,
 } from "./video/decode";
@@ -118,14 +119,6 @@ export function coarseSampleCount(durationSec: number): number {
 const REFINE_SAMPLES = 12;
 const REFINE_ROUNDS = 2;
 
-/**
- * Time gap above which two extracted positions must show different frames.
- *
- * Below this, positions can legitimately land on the same frame (a freeze in
- * a step-frame clip, or two events a hair apart), so the stale-frame check is
- * skipped. Above it, an unchanged capture means the surface is stale.
- */
-const MIN_DISTINCT_SEC = 0.12;
 
 /** Seconds between coarse samples. */
 export function sampleIntervalSeconds(
@@ -285,7 +278,11 @@ export async function analyzeSwing(
       halfWidth = (2 * halfWidth) / (REFINE_SAMPLES - 1);
     }
 
-    // 3. Fetch the frames that will actually be shown.
+    // 3. Fetch the frames that will actually be shown, freshly presented.
+    // Each frame is grabbed by playing into its time (grabFrameAt), which is
+    // what makes it reliable on iOS: a plain seek there can leave the surface
+    // on a stale frame. Positions are visited in time order so playback only
+    // ever moves forward, never re-seeking backwards across the whole clip.
     const tiles = {} as Record<EventName, HTMLCanvasElement | null>;
     const eventPoses = {} as Record<EventName, Pose | null>;
     for (const name of EVENTS) {
@@ -293,52 +290,37 @@ export async function analyzeSwing(
       eventPoses[name] = null;
     }
 
-    // Positions are seeked in time order, so consecutive captures should show
-    // different frames unless two positions genuinely share a moment. That
-    // lets each capture demand it actually changed from the last, catching an
-    // iOS surface that seeked but kept painting the previous frame.
     const order = [...EVENTS].sort((a, b) => eventTimes[a] - eventTimes[b]);
-    const targetTimes = order.map((name) => eventTimes[name]);
-    let prevSignature: number[] | null = null;
-    let prevTarget = -Infinity;
-
-    await sampleAtTimes(
-      file,
-      () => targetTimes,
-      async ({ video, timeSec, index }) => {
+    const { video, release } = await loadVideo(file, signal);
+    try {
+      for (let index = 0; index < order.length; index++) {
+        if (signal?.aborted) throw new Error("Cancelled.");
         const name = order[index];
-        const target = targetTimes[index];
-        // Only require a change when the seek moved far enough that the frame
-        // must differ; adjacent freeze frames legitimately look identical.
-        const expectChange = target - prevTarget > MIN_DISTINCT_SEC;
-        const { canvas, signature } = await captureFreshFrame(
+        const canvas = await grabFrameAt(
           video,
+          eventTimes[name],
           maxTileSize,
           rotate,
-          expectChange ? prevSignature : null,
+          signal,
         );
         tiles[name] = canvas;
-        prevSignature = signature;
-        prevTarget = target;
         // Pose the tile rather than the video: angles are scale-invariant, and
         // this way the overlay is already in the tile's coordinates.
         const pose = firstPose(landmarker.detect(canvas), canvas.width, canvas.height);
         eventPoses[name] = pose;
         posesRun++;
         if (pose) posesFound++;
-        // The nudge that repaints the frame advances currentTime by about a
-        // frame, so report where it actually landed, not the pre-nudge seek.
-        eventTimes[name] = Number.isFinite(video.currentTime)
-          ? video.currentTime
-          : timeSec;
+        // Report the frame actually landed on (at or just after the target).
+        if (Number.isFinite(video.currentTime)) eventTimes[name] = video.currentTime;
         onProgress?.({
           phase: "extracting",
           done: index + 1,
           total: EVENTS.length,
         });
-      },
-      { signal },
-    );
+      }
+    } finally {
+      release();
+    }
 
     return {
       durationSec: meta.durationSec,
