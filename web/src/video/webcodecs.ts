@@ -31,6 +31,7 @@ export function webCodecsSupported(): boolean {
 interface Mp4Sample {
   data?: Uint8Array;
   cts: number;
+  dts: number;
   timescale: number;
   is_sync: boolean;
 }
@@ -72,7 +73,10 @@ interface Mp4File {
 
 interface DemuxSample {
   data: Uint8Array;
-  timestampSec: number;
+  /** Presentation time (composition), which is what a target matches against. */
+  presentationSec: number;
+  /** Decode time, which is the order chunks must be fed to the decoder. */
+  decodeSec: number;
   isKey: boolean;
 }
 
@@ -138,7 +142,8 @@ async function demux(file: Blob): Promise<Demuxed> {
         if (!s.data) continue;
         samples.push({
           data: s.data,
-          timestampSec: s.cts / s.timescale,
+          presentationSec: s.cts / s.timescale,
+          decodeSec: s.dts / s.timescale,
           isKey: s.is_sync,
         });
       }
@@ -152,7 +157,9 @@ async function demux(file: Blob): Promise<Demuxed> {
 
   const config = await ready;
   if (samples.length === 0) throw new Error("no video samples in clip");
-  samples.sort((a, b) => a.timestampSec - b.timestampSec);
+  // Feed the decoder in DECODE order: with B-frames, presentation order differs
+  // and out-of-order chunks corrupt decoding (intermittent distorted frames).
+  samples.sort((a, b) => a.decodeSec - b.decodeSec);
   return { config, samples, containerRotation };
 }
 
@@ -196,8 +203,13 @@ export async function extractFramesWebCodecs(
   const support = await VideoDecoder.isConfigSupported(config);
   if (!support.supported) throw new Error(`codec unsupported: ${config.codec}`);
 
-  const first = samples[0].timestampSec;
-  const last = samples[samples.length - 1].timestampSec;
+  // Targets match on presentation time, so clamp to the presentation range.
+  let first = Number.POSITIVE_INFINITY;
+  let last = Number.NEGATIVE_INFINITY;
+  for (const s of samples) {
+    if (s.presentationSec < first) first = s.presentationSec;
+    if (s.presentationSec > last) last = s.presentationSec;
+  }
   const targets = targetTimesSec.map((t) => Math.max(first, Math.min(t, last)));
 
   const canvases: (HTMLCanvasElement | null)[] = targets.map(() => null);
@@ -229,10 +241,12 @@ export async function extractFramesWebCodecs(
     for (const s of samples) {
       if (signal?.aborted) throw new Error("Cancelled.");
       if (decodeError) throw decodeError;
+      // Chunk timestamp is the presentation time, so decoded frames carry it
+      // and target matching lines up, even though feeding order is decode order.
       decoder.decode(
         new EncodedVideoChunk({
           type: s.isKey ? "key" : "delta",
-          timestamp: Math.round(s.timestampSec * 1e6),
+          timestamp: Math.round(s.presentationSec * 1e6),
           data: s.data,
         }),
       );
