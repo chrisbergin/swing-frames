@@ -1,76 +1,65 @@
 import { describe, it, expect } from "vitest";
 import {
   DEFAULT_COARSE_SAMPLES,
-  dropRate,
-  MAX_DROP_RATE,
-  retryPlaybackRate,
+  planSampleTimes,
+  planWindowTimes,
   sampleIntervalSeconds,
 } from "./pipeline";
 
 describe("sampleIntervalSeconds", () => {
   it("spreads the samples evenly across the clip", () => {
     expect(sampleIntervalSeconds(4.8, 48)).toBeCloseTo(0.1, 10);
-    // A long clip is sampled more sparsely, which is the whole point: cost
-    // tracks the sample count, not the length of the video.
+    // A long clip is sampled more sparsely, which is the point: cost tracks
+    // the sample count, not the length of the video.
     expect(sampleIntervalSeconds(60, 48)).toBeCloseTo(1.25, 10);
   });
 
   it("keeps a swing's worth of samples well above the episode threshold", () => {
-    // Detection needs at least 3 samples inside a hands-high episode, and
-    // there are two of those in a swing, so the sample count has to leave room.
+    // Detection needs at least 3 samples inside a hands-high episode, and there
+    // are two of those in a swing, so the count has to leave room.
     expect(DEFAULT_COARSE_SAMPLES).toBeGreaterThan(3 * 2 * 4);
   });
 
-  it("disables sampling for a degenerate clip rather than dividing by zero", () => {
+  it("handles a degenerate clip rather than dividing by zero", () => {
     expect(sampleIntervalSeconds(0, 48)).toBe(0);
     expect(sampleIntervalSeconds(NaN, 48)).toBe(0);
     expect(sampleIntervalSeconds(4, 0)).toBe(0);
   });
 });
 
-describe("dropRate", () => {
-  it("measures drops against every frame the decoder saw", () => {
-    expect(dropRate(90, 10)).toBeCloseTo(0.1, 10);
-    expect(dropRate(100, 0)).toBe(0);
+describe("planSampleTimes", () => {
+  it("keeps every sample inside the clip", () => {
+    const times = planSampleTimes(10, 48);
+    expect(times).toHaveLength(48);
+    expect(Math.min(...times)).toBeGreaterThan(0);
+    expect(Math.max(...times)).toBeLessThan(10);
   });
 
-  it("handles a walk that produced nothing", () => {
-    expect(dropRate(0, 0)).toBe(0);
+  it("spaces samples evenly", () => {
+    const times = planSampleTimes(10, 5);
+    expect(times).toEqual([1, 3, 5, 7, 9]);
   });
 
-  it("rejects the run that had every position wrong", () => {
-    // The real numbers from the decode bug: 21 frames through, 36 lost. It
-    // still returned 8 confident tiles, at a misread 15fps.
-    expect(dropRate(21, 36)).toBeGreaterThan(MAX_DROP_RATE);
-  });
-
-  it("tolerates the occasional lost frame, which the track interpolates", () => {
-    expect(dropRate(200, 2)).toBeLessThan(MAX_DROP_RATE);
+  it("still returns something for a zero-length clip", () => {
+    expect(planSampleTimes(0, 48)).toEqual([0]);
   });
 });
 
-describe("retryPlaybackRate", () => {
-  it("slows enough that a frame's work fits in a frame interval", () => {
-    // 30fps is a frame every 33ms; 100ms of work per frame needs roughly a
-    // quarter speed to fit with headroom to spare.
-    const rate = retryPlaybackRate(100, 30, 1);
-    expect(rate).toBeCloseTo((1000 / 30) * 0.7 / 100, 6);
-    expect(1000 / 30 / rate).toBeGreaterThan(100);
+describe("planWindowTimes", () => {
+  it("spans the window and centres on the target", () => {
+    const times = planWindowTimes(5, 1, 5, 10);
+    expect(times).toEqual([4, 4.5, 5, 5.5, 6]);
   });
 
-  it("always ends up slower than the attempt that just failed", () => {
-    // Cheap frames that still dropped: something other than raw speed is
-    // wrong, so back off anyway rather than retrying at the same rate.
-    expect(retryPlaybackRate(1, 30, 1)).toBeLessThan(1);
-    expect(retryPlaybackRate(1, 30, 0.5)).toBeLessThan(0.5);
+  it("clamps to the clip rather than seeking off the end", () => {
+    const times = planWindowTimes(0.1, 1, 5, 10);
+    expect(Math.min(...times)).toBe(0);
+    const late = planWindowTimes(9.9, 1, 5, 10);
+    expect(Math.max(...late)).toBeLessThanOrEqual(10);
   });
 
-  it("refuses to slow past the point of being worth waiting for", () => {
-    expect(retryPlaybackRate(100000, 240, 1)).toBe(0.05);
-  });
-
-  it("survives a degenerate first attempt", () => {
-    expect(retryPlaybackRate(0, 30, 1)).toBe(0.05);
-    expect(retryPlaybackRate(50, 0, 1)).toBe(0.05);
+  it("degrades to the centre when asked for a single sample", () => {
+    expect(planWindowTimes(5, 1, 1, 10)).toEqual([5]);
   });
 });
+

@@ -142,13 +142,13 @@ function PositionDetail({
         <FrameTile
           tile={yours.tiles[name]}
           pose={yours.eventPoses[name]}
-          caption={`you · frame ${yours.events[name]}`}
+          caption={`you · ${yours.eventTimes[name].toFixed(2)}s`}
         />
         {pro && (
           <FrameTile
             tile={pro.tiles[name]}
             pose={pro.eventPoses[name]}
-            caption={`reference · frame ${pro.events[name]}`}
+            caption={`reference · ${pro.eventTimes[name].toFixed(2)}s`}
           />
         )}
       </div>
@@ -174,15 +174,8 @@ function Diagnostics({
 }) {
   return (
     <li>
-      <strong>{text}:</strong> {analysis.frameCount} frames at{" "}
-      {analysis.fps.toFixed(1)} fps, {analysis.width}&times;{analysis.height}
-      , {analysis.posesRun} poses
-      {analysis.playbackRate < 1 && (
-        <>, decoded at {Math.round(analysis.playbackRate * 100)}% speed</>
-      )}
-      {analysis.droppedFrames > 0 && (
-        <span className="warn">, {analysis.droppedFrames} dropped</span>
-      )}
+      <strong>{text}:</strong> {analysis.durationSec.toFixed(1)}s,{" "}
+      {analysis.width}&times;{analysis.height}, {analysis.posesRun} poses
     </li>
   );
 }
@@ -208,18 +201,14 @@ export default function App() {
       const analyse = (file: File, name: string) =>
         analyzeSwing(file, {
           model,
-          onProgress: ({ phase, done, total, playbackRate }) => {
-            const scope = total ? `${done}/${total}` : `${done}`;
-            // Tell them why it got slow, rather than looking stalled.
-            const slowed =
-              playbackRate < 1
-                ? ` · slowed to ${Math.round(playbackRate * 100)}% so no frames are missed`
-                : "";
-            setStatus(
+          onProgress: ({ phase, done, total }) => {
+            const verb =
               phase === "tracking"
-                ? `Tracking ${name}: ${scope} frames${slowed}`
-                : `Extracting ${name}: ${scope} frames${slowed}`,
-            );
+                ? "Tracking"
+                : phase === "refining"
+                  ? "Pinning down impact in"
+                  : "Grabbing frames from";
+            setStatus(`${verb} ${name}: ${done}/${total}`);
           },
         });
 

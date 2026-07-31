@@ -264,6 +264,59 @@ export async function walkVideoFrames(
   }
 }
 
+/** One frame fetched by seeking, with the time it actually landed on. */
+export interface SampledFrame {
+  video: HTMLVideoElement;
+  /** Where the seek actually landed, which is not exactly what was asked for. */
+  timeSec: number;
+  index: number;
+}
+
+/**
+ * Visit a list of times by seeking, without playing the video.
+ *
+ * The project's standing rule is to decode sequentially and never seek, and it
+ * still holds wherever a specific frame *number* matters: seeking lands a frame
+ * or two off, and an earlier debugging session lost hours to exactly that.
+ *
+ * It does not apply here. This reports the time each seek actually landed on,
+ * so nothing depends on hitting an exact frame, and in exchange it escapes the
+ * cost that playback imposes: requestVideoFrameCallback only fires while the
+ * video plays, so walking a 15 second clip takes 15 seconds however few frames
+ * are wanted from it. Seeking to 48 points takes as long as 48 seeks.
+ */
+export async function sampleAtTimes(
+  file: Blob,
+  plan: (durationSec: number) => number[],
+  onSample: (sample: SampledFrame) => void,
+  { signal }: { signal?: AbortSignal } = {},
+): Promise<{ width: number; height: number; durationSec: number; samples: number }> {
+  const { video, release } = await loadVideo(file, signal);
+
+  try {
+    const times = plan(video.duration);
+    let index = 0;
+
+    for (const target of times) {
+      if (signal?.aborted) throw new Error("Cancelled.");
+      // Clamp inside the media: seeking to exactly duration can never resolve.
+      video.currentTime = Math.max(0, Math.min(target, video.duration - 1e-3));
+      await once(video, "seeked", signal);
+      onSample({ video, timeSec: video.currentTime, index });
+      index++;
+    }
+
+    return {
+      width: video.videoWidth,
+      height: video.videoHeight,
+      durationSec: video.duration,
+      samples: index,
+    };
+  } finally {
+    release();
+  }
+}
+
 /**
  * Copy the video's current frame into a new canvas, scaled to fit.
  *
