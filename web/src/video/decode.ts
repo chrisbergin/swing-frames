@@ -318,35 +318,62 @@ export function captureFrame(
   return canvas;
 }
 
+/** A captured frame and its coarse signature, so callers can chain freshness
+ * checks without re-probing. */
+export interface CapturedFrame {
+  canvas: HTMLCanvasElement;
+  signature: number[];
+}
+
 /**
- * Capture the current frame, waiting out presentation glitches.
+ * Two signatures far enough apart to be genuinely different frames.
  *
- * Reading right after "seeked" is usually correct but not always: measured
- * against sequential ground truth, an occasional capture holds a frame
- * several frames away from where the seek landed (a different position each
- * run), and on iOS a never-settled surface reads black. So capture until two
- * consecutive reads agree: a settled frame converges immediately, a glitched
- * one gets replaced by what the surface settles on.
+ * Mean absolute luminance (0-255) per 8x8 cell. Real swing motion between two
+ * distinct positions moves this by tens; sensor noise and compression jitter
+ * on a truly identical frame stay well under this.
  */
-export async function captureSettledFrame(
+const CHANGE_THRESHOLD = 3;
+
+/** How long to wait between re-reads while a stale surface catches up. */
+const FRESH_RETRY_MS = 50;
+/** Give a stale surface this many tries to present the sought frame. */
+const FRESH_ATTEMPTS = 8;
+
+/**
+ * Capture the frame the video has actually seeked to, not a stale one.
+ *
+ * The failure this fixes: on iOS Safari a seek updates currentTime and fires
+ * "seeked", but the surface can keep showing the *previous* frame for a beat.
+ * Detection still gets the right time (it reads landmarks, not pixels), yet
+ * the displayed tile is a frame from wherever the video was before, so a
+ * position looks stuck on an earlier one, differently each run.
+ *
+ * The tell is that the pixels have not changed from the previously captured
+ * position, even though the seek moved somewhere visibly different. So when
+ * the caller says this frame should differ from the last one, wait until the
+ * capture actually differs (or the attempts run out, never hanging). Black
+ * frames, a separate iOS quirk, are retried the same way.
+ *
+ * On desktop, where the surface is already correct, the first capture differs
+ * immediately and this returns at once.
+ */
+export async function captureFreshFrame(
   video: HTMLVideoElement,
   maxLongSide: number,
   rotation: Rotation = 0,
-): Promise<HTMLCanvasElement> {
-  let tile = captureFrame(video, maxLongSide, rotation);
-  for (let attempt = 0; attempt < 3 && isBlankCanvas(tile); attempt++) {
-    await settleDelay();
-    tile = captureFrame(video, maxLongSide, rotation);
+  previous?: readonly number[] | null,
+): Promise<CapturedFrame> {
+  let canvas = captureFrame(video, maxLongSide, rotation);
+  let signature = probeSignature(canvas);
+
+  for (let attempt = 0; attempt < FRESH_ATTEMPTS; attempt++) {
+    const blank = isBlankCanvas(canvas);
+    const stale =
+      previous != null && signatureDiff(signature, previous) < CHANGE_THRESHOLD;
+    if (!blank && !stale) break;
+    await settleDelay(FRESH_RETRY_MS);
+    canvas = captureFrame(video, maxLongSide, rotation);
+    signature = probeSignature(canvas);
   }
-  let sig = probeSignature(tile);
-  for (let attempt = 0; attempt < 3; attempt++) {
-    await settleDelay(40);
-    const next = captureFrame(video, maxLongSide, rotation);
-    const nextSig = probeSignature(next);
-    const settled = signatureDiff(sig, nextSig) < 1;
-    tile = next;
-    sig = nextSig;
-    if (settled) break;
-  }
-  return tile;
+  return { canvas, signature };
 }

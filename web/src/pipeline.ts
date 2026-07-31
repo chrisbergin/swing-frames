@@ -34,7 +34,7 @@ import {
 import { detectEvents, SwingDetectionError, wristTrack } from "./core/events";
 import { createLandmarker, firstPose, type ModelName } from "./pose/landmarker";
 import {
-  captureSettledFrame,
+  captureFreshFrame,
   drawRotatedFrame,
   sampleAtTimes,
   type Rotation,
@@ -117,6 +117,15 @@ export function coarseSampleCount(durationSec: number): number {
 /** Samples per impact-narrowing round, and how many rounds to run. */
 const REFINE_SAMPLES = 12;
 const REFINE_ROUNDS = 2;
+
+/**
+ * Time gap above which two extracted positions must show different frames.
+ *
+ * Below this, positions can legitimately land on the same frame (a freeze in
+ * a step-frame clip, or two events a hair apart), so the stale-frame check is
+ * skipped. Above it, an unchanged capture means the surface is stale.
+ */
+const MIN_DISTINCT_SEC = 0.12;
 
 /** Seconds between coarse samples. */
 export function sampleIntervalSeconds(
@@ -284,17 +293,36 @@ export async function analyzeSwing(
       eventPoses[name] = null;
     }
 
+    // Positions are seeked in time order, so consecutive captures should show
+    // different frames unless two positions genuinely share a moment. That
+    // lets each capture demand it actually changed from the last, catching an
+    // iOS surface that seeked but kept painting the previous frame.
     const order = [...EVENTS].sort((a, b) => eventTimes[a] - eventTimes[b]);
+    const targetTimes = order.map((name) => eventTimes[name]);
+    let prevSignature: number[] | null = null;
+    let prevTarget = -Infinity;
+
     await sampleAtTimes(
       file,
-      () => order.map((name) => eventTimes[name]),
+      () => targetTimes,
       async ({ video, timeSec, index }) => {
         const name = order[index];
-        const tile = await captureSettledFrame(video, maxTileSize, rotate);
-        tiles[name] = tile;
+        const target = targetTimes[index];
+        // Only require a change when the seek moved far enough that the frame
+        // must differ; adjacent freeze frames legitimately look identical.
+        const expectChange = target - prevTarget > MIN_DISTINCT_SEC;
+        const { canvas, signature } = await captureFreshFrame(
+          video,
+          maxTileSize,
+          rotate,
+          expectChange ? prevSignature : null,
+        );
+        tiles[name] = canvas;
+        prevSignature = signature;
+        prevTarget = target;
         // Pose the tile rather than the video: angles are scale-invariant, and
         // this way the overlay is already in the tile's coordinates.
-        const pose = firstPose(landmarker.detect(tile), tile.width, tile.height);
+        const pose = firstPose(landmarker.detect(canvas), canvas.width, canvas.height);
         eventPoses[name] = pose;
         posesRun++;
         if (pose) posesFound++;
