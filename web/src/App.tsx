@@ -300,7 +300,8 @@ function Diagnostics({
     <li>
       <strong>{text}:</strong> {analysis.durationSec.toFixed(1)}s,{" "}
       {analysis.width}&times;{analysis.height}, golfer found in{" "}
-      {analysis.posesFound} of {analysis.posesRun} detections
+      {analysis.posesFound} of {analysis.posesRun} detections, capture via{" "}
+      {analysis.captureMethod}
     </li>
   );
 }

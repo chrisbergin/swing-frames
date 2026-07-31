@@ -237,16 +237,24 @@ export function rotatedSize(
   return { width: swapped ? h : w, height: swapped ? w : h };
 }
 
-/** Draw the video's current frame into `canvas`, rotated clockwise and scaled. */
-export function drawRotatedFrame(
+/**
+ * Draw any image source into `canvas`, rotated clockwise and scaled.
+ *
+ * Works for an <video> element and a WebCodecs VideoFrame alike, so both
+ * capture paths share one rotation implementation. `srcW`/`srcH` are the
+ * source's intrinsic pixels.
+ */
+export function drawImageRotated(
   canvas: HTMLCanvasElement,
-  video: HTMLVideoElement,
+  source: CanvasImageSource,
+  srcW: number,
+  srcH: number,
   rotation: Rotation,
   scale = 1,
 ): void {
-  const w = Math.round(video.videoWidth * scale);
-  const h = Math.round(video.videoHeight * scale);
-  const size = rotatedSize(video.videoWidth, video.videoHeight, rotation, scale);
+  const w = Math.round(srcW * scale);
+  const h = Math.round(srcH * scale);
+  const size = rotatedSize(srcW, srcH, rotation, scale);
   canvas.width = size.width;
   canvas.height = size.height;
   const ctx = canvas.getContext("2d");
@@ -262,8 +270,18 @@ export function drawRotatedFrame(
     ctx.translate(0, canvas.height);
     ctx.rotate(-Math.PI / 2);
   }
-  ctx.drawImage(video, 0, 0, w, h);
+  ctx.drawImage(source, 0, 0, w, h);
   ctx.restore();
+}
+
+/** Draw the video's current frame into `canvas`, rotated clockwise and scaled. */
+export function drawRotatedFrame(
+  canvas: HTMLCanvasElement,
+  video: HTMLVideoElement,
+  rotation: Rotation,
+  scale = 1,
+): void {
+  drawImageRotated(canvas, video, video.videoWidth, video.videoHeight, rotation, scale);
 }
 
 /**

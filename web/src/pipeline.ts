@@ -40,6 +40,7 @@ import {
   sampleAtTimes,
   type Rotation,
 } from "./video/decode";
+import { extractFramesWebCodecs, webCodecsSupported } from "./video/webcodecs";
 
 export interface AnalyzeProgress {
   phase: "tracking" | "refining" | "extracting";
@@ -68,6 +69,10 @@ export interface SwingAnalysis {
   /** How many of those found a person. Low against posesRun means the golfer
    * was not visible: cropped, tiny, sideways, or absent. */
   posesFound: number;
+  /** How the displayed frames were captured. "video" means WebCodecs was
+   * unavailable or could not read the clip and it fell back to the <video>
+   * element. */
+  captureMethod: "webcodecs" | "video";
   /**
    * When each position happens, in seconds.
    *
@@ -291,35 +296,62 @@ export async function analyzeSwing(
     }
 
     const order = [...EVENTS].sort((a, b) => eventTimes[a] - eventTimes[b]);
-    const { video, release } = await loadVideo(file, signal);
-    try {
-      for (let index = 0; index < order.length; index++) {
-        if (signal?.aborted) throw new Error("Cancelled.");
-        const name = order[index];
-        const canvas = await grabFrameAt(
-          video,
-          eventTimes[name],
+    const targetTimes = order.map((name) => eventTimes[name]);
+
+    // Prefer WebCodecs: it decodes exact frames with no <video> surface, which
+    // is what the compositor-driven capture gets wrong on iOS. Any failure
+    // (unsupported browser, a container the demuxer cannot read) falls back to
+    // the <video> capture, so a browser WebCodecs cannot serve is never worse
+    // off than before.
+    let grabbed: Array<{ canvas: HTMLCanvasElement; timeSec: number }> | null = null;
+    let captureMethod: "webcodecs" | "video" = "video";
+    if (webCodecsSupported()) {
+      try {
+        grabbed = await extractFramesWebCodecs(
+          file,
+          targetTimes,
           maxTileSize,
           rotate,
           signal,
         );
+        captureMethod = "webcodecs";
+      } catch {
+        grabbed = null;
+      }
+    }
+
+    if (grabbed) {
+      grabbed.forEach(({ canvas, timeSec }, index) => {
+        const name = order[index];
         tiles[name] = canvas;
-        // Pose the tile rather than the video: angles are scale-invariant, and
-        // this way the overlay is already in the tile's coordinates.
         const pose = firstPose(landmarker.detect(canvas), canvas.width, canvas.height);
         eventPoses[name] = pose;
         posesRun++;
         if (pose) posesFound++;
-        // Report the frame actually landed on (at or just after the target).
-        if (Number.isFinite(video.currentTime)) eventTimes[name] = video.currentTime;
-        onProgress?.({
-          phase: "extracting",
-          done: index + 1,
-          total: EVENTS.length,
-        });
+        eventTimes[name] = timeSec;
+        onProgress?.({ phase: "extracting", done: index + 1, total: EVENTS.length });
+      });
+    } else {
+      const { video, release } = await loadVideo(file, signal);
+      try {
+        for (let index = 0; index < order.length; index++) {
+          if (signal?.aborted) throw new Error("Cancelled.");
+          const name = order[index];
+          const canvas = await grabFrameAt(video, eventTimes[name], maxTileSize, rotate, signal);
+          tiles[name] = canvas;
+          // Pose the tile rather than the video: angles are scale-invariant, and
+          // this way the overlay is already in the tile's coordinates.
+          const pose = firstPose(landmarker.detect(canvas), canvas.width, canvas.height);
+          eventPoses[name] = pose;
+          posesRun++;
+          if (pose) posesFound++;
+          // Report the frame actually landed on (at or just after the target).
+          if (Number.isFinite(video.currentTime)) eventTimes[name] = video.currentTime;
+          onProgress?.({ phase: "extracting", done: index + 1, total: EVENTS.length });
+        }
+      } finally {
+        release();
       }
-    } finally {
-      release();
     }
 
     return {
@@ -328,6 +360,7 @@ export async function analyzeSwing(
       height: meta.height,
       posesRun,
       posesFound,
+      captureMethod,
       eventTimes,
       eventPoses,
       tiles,
