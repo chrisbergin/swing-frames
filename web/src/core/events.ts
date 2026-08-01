@@ -244,14 +244,20 @@ export function detectEvents(ys: readonly number[], fps: number): EventFrames {
   // zone; selectImpactFrame() re-measures the window afterwards.
   const impact = argMax(ys, top, impactZoneEnd);
 
+  // Downswing and follow-through mids are placed by time (the frame halfway
+  // through the phase), not by a wrist-height crossing. A height crossing fires
+  // at a different point on two different swings, so the club lands on opposite
+  // sides in a comparison; the halfway-by-time frame is tempo-normalized and
+  // corresponds across swings. Those phases are also fast and noisy, where a
+  // crossing is least reliable.
   const found: Record<EventName, number | null> = {
     address,
     toe_up: crossing(ys, address, top, baseline - 0.3 * rng, "up"),
     mid_backswing: crossing(ys, address, top, baseline - 0.7 * rng, "up"),
     top,
-    mid_downswing: crossing(ys, top, impact, baseline - 0.5 * rng, "down"),
+    mid_downswing: Math.round(top + 0.5 * (impact - top)),
     impact,
-    mid_follow_through: crossing(ys, impact + 1, finish + 1, baseline - 0.5 * rng, "up"),
+    mid_follow_through: Math.round(impact + 0.5 * (finish - impact)),
     finish,
   };
 

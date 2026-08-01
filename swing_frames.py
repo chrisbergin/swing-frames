@@ -222,8 +222,14 @@ def detect_events(xs: np.ndarray, ys: np.ndarray, fps: float) -> dict:
 
     toe_up = crossing(ys, address, top, baseline - 0.30 * rng, "up")
     mid_back = crossing(ys, address, top, baseline - 0.70 * rng, "up")
-    mid_down = crossing(ys, top, impact, baseline - 0.50 * rng, "down")
-    mid_follow = crossing(ys, impact + 1, finish + 1, baseline - 0.50 * rng, "up")
+    # Downswing and follow-through mids are placed by time (the frame halfway
+    # through the phase), not by a wrist-height crossing. A height crossing
+    # fires at a different point on two different swings, so the club lands on
+    # opposite sides in a comparison; the halfway-by-time frame is tempo-
+    # normalized and corresponds across swings. The downswing/follow-through
+    # is also fast and noisy, where a crossing is least reliable.
+    mid_down = int(round(top + 0.5 * (impact - top)))
+    mid_follow = int(round(impact + 0.5 * (finish - impact)))
 
     events = {
         "address": address, "toe_up": toe_up, "mid_backswing": mid_back,
