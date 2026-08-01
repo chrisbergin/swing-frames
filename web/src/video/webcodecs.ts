@@ -182,84 +182,152 @@ function drawVideoFrame(
 }
 
 /**
- * Decode the clip once and return the frame at each requested time.
+ * A demuxed clip that can decode frames on demand without a <video> element.
  *
- * For every target, the frame kept is the earliest whose timestamp is at or
- * after it (matching the <video> path and how impact is defined). Targets are
- * clamped inside the clip so each one always resolves to a real frame.
+ * Demuxing happens once at open; each decode walks the encoded samples through
+ * a fresh VideoDecoder. Because it never touches the compositor, the frame at a
+ * given time is the same on every device, so detection run against it (not just
+ * the displayed frames) comes out identical on desktop and phone. That is what
+ * fixes positions like impact drifting on the phone: the <video> + MediaPipe
+ * detection path is device-dependent, this is not.
  */
-export async function extractFramesWebCodecs(
-  file: Blob,
-  targetTimesSec: readonly number[],
-  maxLongSide: number,
-  rotation: Rotation = 0,
-  signal?: AbortSignal,
-): Promise<ExtractedFrame[]> {
-  const { config, samples, containerRotation } = await demux(file);
-  // A raw VideoFrame lacks the container's own rotation, so fold it in with
-  // any rotation the user asked for.
-  const effectiveRotation = (((containerRotation + rotation) % 360) as Rotation);
+export class WebCodecsClip {
+  private readonly config: VideoDecoderConfig;
+  private readonly samples: DemuxSample[];
+  private readonly containerRotation: Rotation;
+  /** Presentation time span, for clamping requested times into the clip. */
+  readonly firstSec: number;
+  readonly lastSec: number;
 
-  const support = await VideoDecoder.isConfigSupported(config);
-  if (!support.supported) throw new Error(`codec unsupported: ${config.codec}`);
-
-  // Targets match on presentation time, so clamp to the presentation range.
-  let first = Number.POSITIVE_INFINITY;
-  let last = Number.NEGATIVE_INFINITY;
-  for (const s of samples) {
-    if (s.presentationSec < first) first = s.presentationSec;
-    if (s.presentationSec > last) last = s.presentationSec;
+  private constructor(
+    config: VideoDecoderConfig,
+    samples: DemuxSample[],
+    containerRotation: Rotation,
+    firstSec: number,
+    lastSec: number,
+  ) {
+    this.config = config;
+    this.samples = samples;
+    this.containerRotation = containerRotation;
+    this.firstSec = firstSec;
+    this.lastSec = lastSec;
   }
-  const targets = targetTimesSec.map((t) => Math.max(first, Math.min(t, last)));
 
-  const canvases: (HTMLCanvasElement | null)[] = targets.map(() => null);
-  const chosenTs: number[] = targets.map(() => Number.POSITIVE_INFINITY);
-  let decodeError: Error | null = null;
-
-  const decoder = new VideoDecoder({
-    output: (frame) => {
-      try {
-        const t = frame.timestamp / 1e6;
-        for (let i = 0; i < targets.length; i++) {
-          // Earliest frame at or after this target.
-          if (t >= targets[i] - 1e-4 && t < chosenTs[i]) {
-            canvases[i] = drawVideoFrame(frame, maxLongSide, effectiveRotation);
-            chosenTs[i] = t;
-          }
-        }
-      } finally {
-        frame.close();
-      }
-    },
-    error: (e) => {
-      decodeError = e instanceof Error ? e : new Error(String(e));
-    },
-  });
-
-  try {
-    decoder.configure(config);
+  static async open(file: Blob): Promise<WebCodecsClip> {
+    const { config, samples, containerRotation } = await demux(file);
+    const support = await VideoDecoder.isConfigSupported(config);
+    if (!support.supported) throw new Error(`codec unsupported: ${config.codec}`);
+    let first = Number.POSITIVE_INFINITY;
+    let last = Number.NEGATIVE_INFINITY;
     for (const s of samples) {
-      if (signal?.aborted) throw new Error("Cancelled.");
-      if (decodeError) throw decodeError;
-      // Chunk timestamp is the presentation time, so decoded frames carry it
-      // and target matching lines up, even though feeding order is decode order.
-      decoder.decode(
-        new EncodedVideoChunk({
-          type: s.isKey ? "key" : "delta",
-          timestamp: Math.round(s.presentationSec * 1e6),
-          data: s.data,
-        }),
-      );
+      if (s.presentationSec < first) first = s.presentationSec;
+      if (s.presentationSec > last) last = s.presentationSec;
     }
-    await decoder.flush();
-  } finally {
-    if (decoder.state !== "closed") decoder.close();
+    return new WebCodecsClip(config, samples, containerRotation, first, last);
   }
-  if (decodeError) throw decodeError;
 
-  return targets.map((t, i) => {
-    const canvas = canvases[i];
-    if (!canvas) throw new Error(`no frame decoded for ${t.toFixed(3)}s`);
-    return { canvas, timeSec: Number.isFinite(chosenTs[i]) ? chosenTs[i] : t };
-  });
+  get durationSec(): number {
+    return this.lastSec;
+  }
+
+  private rotationFor(userRotation: Rotation): Rotation {
+    return ((this.containerRotation + userRotation) % 360) as Rotation;
+  }
+
+  /** Decode the whole clip once, invoking `onFrame` with each frame's time. */
+  private async decodeAll(
+    onFrame: (frame: VideoFrame, timeSec: number) => void,
+    signal?: AbortSignal,
+  ): Promise<void> {
+    let decodeError: Error | null = null;
+    const decoder = new VideoDecoder({
+      output: (frame) => {
+        try {
+          onFrame(frame, frame.timestamp / 1e6);
+        } finally {
+          frame.close();
+        }
+      },
+      error: (e) => {
+        decodeError = e instanceof Error ? e : new Error(String(e));
+      },
+    });
+    try {
+      decoder.configure(this.config);
+      for (const s of this.samples) {
+        if (signal?.aborted) throw new Error("Cancelled.");
+        if (decodeError) throw decodeError;
+        // Fed in decode order (samples are sorted by DTS); the chunk timestamp
+        // is the presentation time so decoded frames carry it for matching.
+        decoder.decode(
+          new EncodedVideoChunk({
+            type: s.isKey ? "key" : "delta",
+            timestamp: Math.round(s.presentationSec * 1e6),
+            data: s.data,
+          }),
+        );
+      }
+      await decoder.flush();
+    } finally {
+      if (decoder.state !== "closed") decoder.close();
+    }
+    if (decodeError) throw decodeError;
+  }
+
+  /**
+   * The frame at each requested time, for display.
+   *
+   * For every target the frame kept is the earliest at or after it (matching
+   * how impact is defined). Targets are clamped inside the clip so each always
+   * resolves to a real frame.
+   */
+  async grab(
+    times: readonly number[],
+    maxLongSide: number,
+    rotation: Rotation = 0,
+    signal?: AbortSignal,
+  ): Promise<ExtractedFrame[]> {
+    const rot = this.rotationFor(rotation);
+    const targets = times.map((t) => Math.max(this.firstSec, Math.min(t, this.lastSec)));
+    const canvases: (HTMLCanvasElement | null)[] = targets.map(() => null);
+    const chosenTs = targets.map(() => Number.POSITIVE_INFINITY);
+
+    await this.decodeAll((frame, t) => {
+      for (let i = 0; i < targets.length; i++) {
+        if (t >= targets[i] - 1e-4 && t < chosenTs[i]) {
+          canvases[i] = drawVideoFrame(frame, maxLongSide, rot);
+          chosenTs[i] = t;
+        }
+      }
+    }, signal);
+
+    return targets.map((t, i) => {
+      const canvas = canvases[i];
+      if (!canvas) throw new Error(`no frame decoded for ${t.toFixed(3)}s`);
+      return { canvas, timeSec: Number.isFinite(chosenTs[i]) ? chosenTs[i] : t };
+    });
+  }
+
+  /**
+   * Draw every frame whose time falls in [loSec, hiSec] and hand it to `onFrame`.
+   *
+   * Used to re-measure a window deterministically (e.g. narrowing impact): the
+   * caller poses each canvas. A modest `maxLongSide` keeps it quick; pose angles
+   * and wrist height are scale-invariant.
+   */
+  async forEachFrameInWindow(
+    loSec: number,
+    hiSec: number,
+    maxLongSide: number,
+    onFrame: (canvas: HTMLCanvasElement, timeSec: number) => void,
+    rotation: Rotation = 0,
+    signal?: AbortSignal,
+  ): Promise<void> {
+    const rot = this.rotationFor(rotation);
+    await this.decodeAll((frame, t) => {
+      if (t >= loSec - 1e-4 && t <= hiSec + 1e-4) {
+        onFrame(drawVideoFrame(frame, maxLongSide, rot), t);
+      }
+    }, signal);
+  }
 }

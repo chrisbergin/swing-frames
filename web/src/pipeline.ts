@@ -40,7 +40,7 @@ import {
   sampleAtTimes,
   type Rotation,
 } from "./video/decode";
-import { extractFramesWebCodecs, webCodecsSupported } from "./video/webcodecs";
+import { WebCodecsClip, webCodecsSupported } from "./video/webcodecs";
 
 export interface AnalyzeProgress {
   phase: "tracking" | "refining" | "extracting";
@@ -120,9 +120,46 @@ export function coarseSampleCount(durationSec: number): number {
   );
 }
 
-/** Samples per impact-narrowing round, and how many rounds to run. */
+/** Samples per impact-narrowing round, and how many rounds to run (the
+ * <video> fallback path only; WebCodecs poses the whole window at once). */
 const REFINE_SAMPLES = 12;
 const REFINE_ROUNDS = 2;
+
+/**
+ * Half-width of the window re-posed around the coarse impact on WebCodecs.
+ *
+ * Generous on purpose: the coarse impact comes from the device-dependent
+ * <video> pass and can be off, so the window must still contain the true
+ * strike for the deterministic re-measure to land on it.
+ */
+const IMPACT_WINDOW_SEC = 0.4;
+
+/** Long side for the refine poses; smaller is faster and angles are scale-free. */
+const REFINE_POSE_SIZE = 480;
+
+/**
+ * The impact time from re-measured wrist heights.
+ *
+ * Hands lowest is the largest y; ball contact comes fractionally after that and
+ * neighbouring frames measure within noise of each other, so take the last (in
+ * time) within a hair of the bottom. Returns null if nothing was measured.
+ */
+function pickImpactTime(
+  measured: ReadonlyArray<{ time: number; y: number }>,
+): number | null {
+  if (measured.length === 0) return null;
+  let bottom = -Infinity;
+  let peak = Infinity;
+  for (const m of measured) {
+    if (m.y > bottom) bottom = m.y;
+    if (m.y < peak) peak = m.y;
+  }
+  const eps = 0.05 * (bottom - peak);
+  const candidates = measured
+    .filter((m) => m.y >= bottom - eps)
+    .sort((a, b) => a.time - b.time);
+  return candidates[candidates.length - 1].time;
+}
 
 
 /** Seconds between coarse samples. */
@@ -244,50 +281,78 @@ export async function analyzeSwing(
       EVENTS.map((name) => [name, coarseTimes[coarse[name]]]),
     ) as Record<EventName, number>;
 
-    // 2. Narrow impact. Each round searches a window a fraction of the last,
-    // so a couple of rounds get from a coarse sample down to a single frame.
-    let halfWidth = sampleIntervalSeconds(meta.durationSec, samples) * 1.5;
+    // Open a WebCodecs clip once, shared by the impact refinement and the
+    // display grab. Decoding never touches the <video> surface, so both come
+    // out identical on desktop and phone; failure (unsupported browser, a
+    // container the demuxer cannot read) leaves it null and everything falls
+    // back to the device-dependent <video> path, no worse off than before.
+    let wcClip: WebCodecsClip | null = null;
+    if (webCodecsSupported()) {
+      try {
+        wcClip = await WebCodecsClip.open(file);
+      } catch {
+        wcClip = null;
+      }
+    }
+    const captureMethod: "webcodecs" | "video" = wcClip ? "webcodecs" : "video";
 
-    for (let round = 0; round < REFINE_ROUNDS; round++) {
+    // 2. Narrow impact.
+    if (wcClip) {
+      // Re-measure a generous window around the coarse impact on decoded
+      // frames. Wide enough to hold the true strike even when the coarse
+      // estimate (from the device-dependent <video> pass) is off, so the
+      // result converges to the same frame on every device.
+      const lo = Math.max(eventTimes.top, eventTimes.impact - IMPACT_WINDOW_SEC);
+      const hi = Math.min(eventTimes.finish, eventTimes.impact + IMPACT_WINDOW_SEC);
       const measured: Array<{ time: number; y: number }> = [];
-      await sampleAtTimes(
-        file,
-        (durationSec) =>
-          planWindowTimes(
-            eventTimes.impact,
-            halfWidth,
-            REFINE_SAMPLES,
-            durationSec,
-          ),
-        ({ video, timeSec }) => {
-          const y = wristHeight(detectCurrentFrame(video));
-          if (!Number.isNaN(y)) measured.push({ time: timeSec, y });
-          onProgress?.({
-            phase: "refining",
-            done: round * REFINE_SAMPLES + measured.length,
-            total: REFINE_ROUNDS * REFINE_SAMPLES,
-          });
+      const estTotal = Math.max(1, Math.round((hi - lo) * 60));
+      await wcClip.forEachFrameInWindow(
+        lo,
+        hi,
+        REFINE_POSE_SIZE,
+        (canvas, t) => {
+          const y = wristHeight(firstPose(landmarker.detect(canvas), canvas.width, canvas.height));
+          posesRun++;
+          if (!Number.isNaN(y)) {
+            posesFound++;
+            measured.push({ time: t, y });
+          }
+          onProgress?.({ phase: "refining", done: measured.length, total: estTotal });
         },
-        { signal },
+        rotate,
+        signal,
       );
-
-      if (measured.length === 0) break;
-      // Hands at their lowest is the largest y. Ball contact comes fractionally
-      // after that, and neighbouring frames measure within noise of each other,
-      // so take the last one within a hair of the bottom.
-      const bottom = Math.max(...measured.map((m) => m.y));
-      const peak = Math.min(...measured.map((m) => m.y));
-      const eps = 0.05 * (bottom - peak);
-      const candidates = measured.filter((m) => m.y >= bottom - eps);
-      eventTimes.impact = candidates[candidates.length - 1].time;
-      halfWidth = (2 * halfWidth) / (REFINE_SAMPLES - 1);
+      const picked = pickImpactTime(measured);
+      if (picked !== null) eventTimes.impact = picked;
+    } else {
+      // Fallback: two-round narrowing over the <video> element, a window a
+      // fraction of the last each round.
+      let halfWidth = sampleIntervalSeconds(meta.durationSec, samples) * 1.5;
+      for (let round = 0; round < REFINE_ROUNDS; round++) {
+        const measured: Array<{ time: number; y: number }> = [];
+        await sampleAtTimes(
+          file,
+          (durationSec) =>
+            planWindowTimes(eventTimes.impact, halfWidth, REFINE_SAMPLES, durationSec),
+          ({ video, timeSec }) => {
+            const y = wristHeight(detectCurrentFrame(video));
+            if (!Number.isNaN(y)) measured.push({ time: timeSec, y });
+            onProgress?.({
+              phase: "refining",
+              done: round * REFINE_SAMPLES + measured.length,
+              total: REFINE_ROUNDS * REFINE_SAMPLES,
+            });
+          },
+          { signal },
+        );
+        const picked = pickImpactTime(measured);
+        if (picked === null) break;
+        eventTimes.impact = picked;
+        halfWidth = (2 * halfWidth) / (REFINE_SAMPLES - 1);
+      }
     }
 
-    // 3. Fetch the frames that will actually be shown, freshly presented.
-    // Each frame is grabbed by playing into its time (grabFrameAt), which is
-    // what makes it reliable on iOS: a plain seek there can leave the surface
-    // on a stale frame. Positions are visited in time order so playback only
-    // ever moves forward, never re-seeking backwards across the whole clip.
+    // 3. Fetch the frames that will actually be shown.
     const tiles = {} as Record<EventName, HTMLCanvasElement | null>;
     const eventPoses = {} as Record<EventName, Pose | null>;
     for (const name of EVENTS) {
@@ -298,26 +363,9 @@ export async function analyzeSwing(
     const order = [...EVENTS].sort((a, b) => eventTimes[a] - eventTimes[b]);
     const targetTimes = order.map((name) => eventTimes[name]);
 
-    // Prefer WebCodecs: it decodes exact frames with no <video> surface, which
-    // is what the compositor-driven capture gets wrong on iOS. Any failure
-    // (unsupported browser, a container the demuxer cannot read) falls back to
-    // the <video> capture, so a browser WebCodecs cannot serve is never worse
-    // off than before.
     let grabbed: Array<{ canvas: HTMLCanvasElement; timeSec: number }> | null = null;
-    let captureMethod: "webcodecs" | "video" = "video";
-    if (webCodecsSupported()) {
-      try {
-        grabbed = await extractFramesWebCodecs(
-          file,
-          targetTimes,
-          maxTileSize,
-          rotate,
-          signal,
-        );
-        captureMethod = "webcodecs";
-      } catch {
-        grabbed = null;
-      }
+    if (wcClip) {
+      grabbed = await wcClip.grab(targetTimes, maxTileSize, rotate, signal);
     }
 
     if (grabbed) {
@@ -332,6 +380,9 @@ export async function analyzeSwing(
         onProgress?.({ phase: "extracting", done: index + 1, total: EVENTS.length });
       });
     } else {
+      // No WebCodecs: grab each frame by playing into its time on the <video>
+      // element, visiting positions in time order so playback only moves
+      // forward. grabFrameAt keeps this off a stale iOS surface as best it can.
       const { video, release } = await loadVideo(file, signal);
       try {
         for (let index = 0; index < order.length; index++) {
