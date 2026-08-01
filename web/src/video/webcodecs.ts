@@ -15,7 +15,7 @@
  */
 
 import { createFile, DataStream, Endianness } from "mp4box";
-import { drawImageRotated, fitScale, type Rotation } from "./decode";
+import { drawImageRotated, fitScale, rotatedSize, type Rotation } from "./decode";
 
 /** Whether this browser can decode frames without a <video> element. */
 export function webCodecsSupported(): boolean {
@@ -228,6 +228,24 @@ export class WebCodecsClip {
 
   get durationSec(): number {
     return this.lastSec;
+  }
+
+  /** Displayed pixel size after the container's own rotation (not the user's),
+   * matching what a <video> element reports. */
+  get displayWidth(): number {
+    return rotatedSize(
+      this.config.codedWidth ?? 0,
+      this.config.codedHeight ?? 0,
+      this.containerRotation,
+    ).width;
+  }
+
+  get displayHeight(): number {
+    return rotatedSize(
+      this.config.codedWidth ?? 0,
+      this.config.codedHeight ?? 0,
+      this.containerRotation,
+    ).height;
   }
 
   private rotationFor(userRotation: Rotation): Rotation {

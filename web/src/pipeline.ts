@@ -137,6 +137,9 @@ const IMPACT_WINDOW_SEC = 0.4;
 /** Long side for the refine poses; smaller is faster and angles are scale-free. */
 const REFINE_POSE_SIZE = 480;
 
+/** Long side for the coarse-pass poses (many frames, so kept small). */
+const COARSE_POSE_SIZE = 320;
+
 /**
  * The impact time from re-measured wrist heights.
  *
@@ -239,31 +242,67 @@ export async function analyzeSwing(
   };
 
   try {
+    // Open a WebCodecs clip up front: when available it drives the whole
+    // analysis (coarse detection, impact refinement, and the display grab), so
+    // every position comes out identical on desktop and phone. Decoding never
+    // touches the <video> surface, the source of the device-dependent drift.
+    // Failure (unsupported browser, a container the demuxer cannot read) leaves
+    // it null and everything falls back to the <video> path, no worse off.
+    let wcClip: WebCodecsClip | null = null;
+    if (webCodecsSupported()) {
+      try {
+        wcClip = await WebCodecsClip.open(file);
+      } catch {
+        wcClip = null;
+      }
+    }
+    const captureMethod: "webcodecs" | "video" = wcClip ? "webcodecs" : "video";
+
     // 1. Coarse pass: the shape of the swing.
     const coarsePoses: Array<Pose | null> = [];
     const coarseTimes: number[] = [];
     let samples = coarseSamples ?? DEFAULT_COARSE_SAMPLES;
 
-    const meta = await sampleAtTimes(
-      file,
-      (durationSec) => {
-        clip.durationSec = durationSec;
-        samples = coarseSamples ?? coarseSampleCount(durationSec);
-        return planSampleTimes(durationSec, samples);
-      },
-      ({ video, timeSec }) => {
-        clip.width = video.videoWidth;
-        clip.height = video.videoHeight;
-        coarsePoses.push(detectCurrentFrame(video));
+    if (wcClip) {
+      samples = coarseSamples ?? coarseSampleCount(wcClip.durationSec);
+      const frames = await wcClip.grab(
+        planSampleTimes(wcClip.durationSec, samples),
+        COARSE_POSE_SIZE,
+        rotate,
+        signal,
+      );
+      clip = {
+        durationSec: wcClip.durationSec,
+        width: wcClip.displayWidth,
+        height: wcClip.displayHeight,
+      };
+      frames.forEach(({ canvas, timeSec }) => {
+        const pose = firstPose(landmarker.detect(canvas), canvas.width, canvas.height);
+        posesRun++;
+        if (pose) posesFound++;
+        coarsePoses.push(pose);
         coarseTimes.push(timeSec);
-        onProgress?.({
-          phase: "tracking",
-          done: coarsePoses.length,
-          total: samples,
-        });
-      },
-      { signal },
-    );
+        onProgress?.({ phase: "tracking", done: coarsePoses.length, total: samples });
+      });
+    } else {
+      const meta = await sampleAtTimes(
+        file,
+        (durationSec) => {
+          clip.durationSec = durationSec;
+          samples = coarseSamples ?? coarseSampleCount(durationSec);
+          return planSampleTimes(durationSec, samples);
+        },
+        ({ video, timeSec }) => {
+          clip.width = video.videoWidth;
+          clip.height = video.videoHeight;
+          coarsePoses.push(detectCurrentFrame(video));
+          coarseTimes.push(timeSec);
+          onProgress?.({ phase: "tracking", done: coarsePoses.length, total: samples });
+        },
+        { signal },
+      );
+      clip.durationSec = meta.durationSec;
+    }
 
     if (coarseTimes.length < 10) {
       throw new SwingDetectionError(
@@ -280,21 +319,6 @@ export async function analyzeSwing(
     const eventTimes = Object.fromEntries(
       EVENTS.map((name) => [name, coarseTimes[coarse[name]]]),
     ) as Record<EventName, number>;
-
-    // Open a WebCodecs clip once, shared by the impact refinement and the
-    // display grab. Decoding never touches the <video> surface, so both come
-    // out identical on desktop and phone; failure (unsupported browser, a
-    // container the demuxer cannot read) leaves it null and everything falls
-    // back to the device-dependent <video> path, no worse off than before.
-    let wcClip: WebCodecsClip | null = null;
-    if (webCodecsSupported()) {
-      try {
-        wcClip = await WebCodecsClip.open(file);
-      } catch {
-        wcClip = null;
-      }
-    }
-    const captureMethod: "webcodecs" | "video" = wcClip ? "webcodecs" : "video";
 
     // 2. Narrow impact.
     if (wcClip) {
@@ -327,7 +351,7 @@ export async function analyzeSwing(
     } else {
       // Fallback: two-round narrowing over the <video> element, a window a
       // fraction of the last each round.
-      let halfWidth = sampleIntervalSeconds(meta.durationSec, samples) * 1.5;
+      let halfWidth = sampleIntervalSeconds(clip.durationSec, samples) * 1.5;
       for (let round = 0; round < REFINE_ROUNDS; round++) {
         const measured: Array<{ time: number; y: number }> = [];
         await sampleAtTimes(
@@ -406,9 +430,9 @@ export async function analyzeSwing(
     }
 
     return {
-      durationSec: meta.durationSec,
-      width: meta.width,
-      height: meta.height,
+      durationSec: clip.durationSec,
+      width: clip.width,
+      height: clip.height,
       posesRun,
       posesFound,
       captureMethod,
