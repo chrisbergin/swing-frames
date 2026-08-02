@@ -348,4 +348,44 @@ export class WebCodecsClip {
       }
     }, signal);
   }
+
+  /**
+   * The `count` frames either side of `centerSec`, for stepping through a
+   * position frame by frame. Returns them in time order with the index of the
+   * frame nearest the centre, so the caller can offset from it.
+   */
+  async framesAround(
+    centerSec: number,
+    count: number,
+    maxLongSide: number,
+    rotation: Rotation = 0,
+    signal?: AbortSignal,
+  ): Promise<{ frames: ExtractedFrame[]; centerIndex: number }> {
+    const rot = this.rotationFor(rotation);
+    const n = this.samples.length;
+    const step = n > 1 ? (this.lastSec - this.firstSec) / (n - 1) : 1 / 30;
+    const lo = centerSec - (count + 2) * step;
+    const hi = centerSec + (count + 2) * step;
+
+    const collected: ExtractedFrame[] = [];
+    await this.decodeAll((frame, t) => {
+      if (t >= lo && t <= hi) {
+        collected.push({ canvas: drawVideoFrame(frame, maxLongSide, rot), timeSec: t });
+      }
+    }, signal);
+    collected.sort((a, b) => a.timeSec - b.timeSec);
+
+    let ci = 0;
+    let best = Number.POSITIVE_INFINITY;
+    collected.forEach((f, i) => {
+      const d = Math.abs(f.timeSec - centerSec);
+      if (d < best) {
+        best = d;
+        ci = i;
+      }
+    });
+    const start = Math.max(0, ci - count);
+    const end = Math.min(collected.length, ci + count + 1);
+    return { frames: collected.slice(start, end), centerIndex: ci - start };
+  }
 }

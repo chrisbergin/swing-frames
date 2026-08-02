@@ -289,6 +289,41 @@ button:disabled {
   gap: 8px;
 }
 
+.side {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  min-width: 0;
+}
+
+.nudge {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 10px;
+}
+
+.nudge-btn {
+  background: var(--panel);
+  color: var(--text-h);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 6px 18px;
+  font-size: 1.1rem;
+  line-height: 1;
+}
+
+.nudge-btn:disabled {
+  opacity: 0.35;
+}
+
+.nudge-label {
+  font-size: 0.75rem;
+  opacity: 0.6;
+  min-width: 3em;
+  text-align: center;
+}
+
 .tile {
   display: flex;
   flex-direction: column;

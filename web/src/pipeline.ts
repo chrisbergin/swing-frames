@@ -73,6 +73,11 @@ export interface SwingAnalysis {
    * unavailable or could not read the clip and it fell back to the <video>
    * element. */
   captureMethod: "webcodecs" | "video";
+  /** The decoded clip, kept alive so the viewer can step frame by frame around
+   * a position. Null when the <video> fallback was used (no frame stepping). */
+  clip: WebCodecsClip | null;
+  /** Rotation applied to this clip, needed to decode more of its frames. */
+  rotation: Rotation;
   /**
    * When each position happens, in seconds.
    *
@@ -436,6 +441,8 @@ export async function analyzeSwing(
       posesRun,
       posesFound,
       captureMethod,
+      clip: wcClip,
+      rotation: rotate,
       eventTimes,
       eventPoses,
       tiles,

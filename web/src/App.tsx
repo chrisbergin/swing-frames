@@ -12,10 +12,94 @@ import "./App.css";
 import { biggestGaps, overallScore, type Similarity } from "./core/angles";
 import { EVENTS, type EventName, type Pose } from "./core/constants";
 import { analyzeSwing, compareAnalyses, type SwingAnalysis } from "./pipeline";
-import type { ModelName } from "./pose/landmarker";
+import { createLandmarker, firstPose, type ModelName } from "./pose/landmarker";
 import { resolveCrops, videoAnchor, type CropRect } from "./ui/crop";
 import { drawPose } from "./ui/draw";
 import type { Rotation } from "./video/decode";
+
+/** Frames either side of a position to make available for stepping. */
+const NUDGE_HALF = 8;
+/** Long side for stepped frames; matches the tiles so crops line up. */
+const NUDGE_SIZE = 720;
+
+type Side = "yours" | "pro";
+
+interface NudgeFrame {
+  canvas: HTMLCanvasElement;
+  pose: Pose | null;
+  timeSec: number;
+}
+interface SideWindow {
+  frames: NudgeFrame[];
+  center: number;
+}
+
+/**
+ * Lazily decode a window of frames around the selected position so it can be
+ * stepped through frame by frame, per side and on demand.
+ *
+ * Nothing decodes until the first step for a side: viewing positions stays
+ * instant. The window is dropped when the position changes, so memory is
+ * bounded to the one position being examined (both sides), not all eight.
+ */
+function useNudge(results: Results | null, selected: EventName, model: ModelName) {
+  const [windows, setWindows] = useState<Record<Side, SideWindow | null>>({
+    yours: null,
+    pro: null,
+  });
+  const [offsets, setOffsets] = useState<Record<Side, number>>({ yours: 0, pro: 0 });
+  const [loading, setLoading] = useState<Record<Side, boolean>>({
+    yours: false,
+    pro: false,
+  });
+  const lmRef = useRef<ReturnType<typeof createLandmarker> | null>(null);
+
+  useEffect(() => {
+    setWindows({ yours: null, pro: null });
+    setOffsets({ yours: 0, pro: 0 });
+  }, [selected, results]);
+
+  const step = useCallback(
+    async (side: Side, delta: number) => {
+      const analysis = side === "yours" ? results?.yours : (results?.pro ?? null);
+      let win = windows[side];
+      if (!win) {
+        if (!analysis?.clip || loading[side]) return;
+        setLoading((l) => ({ ...l, [side]: true }));
+        try {
+          const lm = await (lmRef.current ??= createLandmarker("IMAGE", { model }));
+          const { frames, centerIndex } = await analysis.clip.framesAround(
+            analysis.eventTimes[selected],
+            NUDGE_HALF,
+            NUDGE_SIZE,
+            analysis.rotation,
+          );
+          win = {
+            frames: frames.map((f) => ({
+              canvas: f.canvas,
+              timeSec: f.timeSec,
+              pose: firstPose(lm.detect(f.canvas), f.canvas.width, f.canvas.height),
+            })),
+            center: centerIndex,
+          };
+          setWindows((w) => ({ ...w, [side]: win }));
+        } finally {
+          setLoading((l) => ({ ...l, [side]: false }));
+        }
+      }
+      const w = win;
+      if (!w) return;
+      setOffsets((o) => {
+        const lo = -w.center;
+        const hi = w.frames.length - 1 - w.center;
+        return { ...o, [side]: Math.max(lo, Math.min(o[side] + delta, hi)) };
+      });
+    },
+    [results, selected, model, windows, loading],
+  );
+
+  return { windows, offsets, loading, step };
+}
 
 const ROTATIONS: Array<[Rotation, string]> = [
   [0, "no rotation"],
@@ -172,16 +256,82 @@ function ContactSheet({
   );
 }
 
+/** One side of the detail: the frame, its caption, and frame-step controls. */
+function SideFrame({
+  sideLabel,
+  analysis,
+  name,
+  crop,
+  window: win,
+  offset,
+  loading,
+  onStep,
+}: {
+  sideLabel: string;
+  analysis: SwingAnalysis;
+  name: EventName;
+  crop: CropRect | null;
+  window: SideWindow | null;
+  offset: number;
+  loading: boolean;
+  onStep: (delta: number) => void;
+}) {
+  const idx = win ? win.center + offset : 0;
+  const current = win ? win.frames[idx] : null;
+  const tile = current ? current.canvas : analysis.tiles[name];
+  const pose = current ? current.pose : analysis.eventPoses[name];
+  const timeSec = current ? current.timeSec : analysis.eventTimes[name];
+  const canStep = analysis.clip !== null;
+  const atStart = win ? idx <= 0 : false;
+  const atEnd = win ? idx >= win.frames.length - 1 : false;
+
+  return (
+    <div className="side">
+      <FrameTile
+        tile={tile}
+        pose={pose}
+        crop={crop}
+        caption={`${sideLabel} · ${timeSec.toFixed(2)}s${offset ? ` (${offset > 0 ? "+" : ""}${offset})` : ""}`}
+      />
+      {canStep && (
+        <div className="nudge">
+          <button
+            type="button"
+            className="nudge-btn"
+            aria-label="previous frame"
+            disabled={loading || atStart}
+            onClick={() => onStep(-1)}
+          >
+            ‹
+          </button>
+          <span className="nudge-label">{loading ? "…" : "frame"}</span>
+          <button
+            type="button"
+            className="nudge-btn"
+            aria-label="next frame"
+            disabled={loading || atEnd}
+            onClick={() => onStep(1)}
+          >
+            ›
+          </button>
+        </div>
+      )}
+    </div>
+  );
+}
+
 /** The selected position, large. Arrows, swipe, and arrow keys step through. */
 function PositionDetail({
   name,
   results,
+  model,
   onStep,
   align,
   onAlign,
 }: {
   name: EventName;
   results: Results;
+  model: ModelName;
   onStep: (delta: number) => void;
   align: boolean;
   onAlign: (value: boolean) => void;
@@ -189,6 +339,7 @@ function PositionDetail({
   const { yours, pro, similarity } = results;
   const position = similarity?.[name] ?? null;
   const touch = useRef<{ x: number; y: number } | null>(null);
+  const { windows, offsets, loading, step } = useNudge(results, name, model);
 
   // One crop per video, anchored on the median across all 8 poses, so the
   // view stays still while stepping and one bad pose cannot bend it. The
@@ -252,18 +403,26 @@ function PositionDetail({
       </header>
 
       <div className="frames">
-        <FrameTile
-          tile={yours.tiles[name]}
-          pose={yours.eventPoses[name]}
+        <SideFrame
+          sideLabel="you"
+          analysis={yours}
+          name={name}
           crop={yoursCrop}
-          caption={`you · ${yours.eventTimes[name].toFixed(2)}s`}
+          window={windows.yours}
+          offset={offsets.yours}
+          loading={loading.yours}
+          onStep={(d) => step("yours", d)}
         />
         {pro && (
-          <FrameTile
-            tile={pro.tiles[name]}
-            pose={pro.eventPoses[name]}
+          <SideFrame
+            sideLabel="reference"
+            analysis={pro}
+            name={name}
             crop={proCrop}
-            caption={`reference · ${pro.eventTimes[name].toFixed(2)}s`}
+            window={windows.pro}
+            offset={offsets.pro}
+            loading={loading.pro}
+            onStep={(d) => step("pro", d)}
           />
         )}
       </div>
@@ -556,6 +715,7 @@ export default function App() {
             <PositionDetail
               name={selected}
               results={results}
+              model={model}
               onStep={step}
               align={align}
               onAlign={setAlign}
