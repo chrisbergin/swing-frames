@@ -9,96 +9,152 @@
 
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import "./App.css";
-import { biggestGaps, overallScore, type Similarity } from "./core/angles";
+import {
+  biggestGaps,
+  compareEventPoses,
+  overallScore,
+  type PositionSimilarity,
+  type Similarity,
+} from "./core/angles";
 import { EVENTS, type EventName, type Pose } from "./core/constants";
 import { analyzeSwing, compareAnalyses, type SwingAnalysis } from "./pipeline";
 import { createLandmarker, firstPose, type ModelName } from "./pose/landmarker";
 import { resolveCrops, videoAnchor, type CropRect } from "./ui/crop";
 import { drawPose } from "./ui/draw";
+import {
+  anyNudged,
+  clampOffset,
+  emptyNudges,
+  frameAt,
+  halfFor,
+  nextHalf,
+  offsetOf,
+  posesInPlay,
+  setNudge,
+  shouldWiden,
+  NUDGE_SIZE,
+  type NudgeMap,
+  type NudgeStore,
+  type NudgeWindow,
+  type Side,
+} from "./ui/nudge";
 import type { Rotation } from "./video/decode";
 
-/** Frames either side of a position to make available for stepping. */
-const NUDGE_HALF = 8;
-/** Long side for stepped frames; matches the tiles so crops line up. */
-const NUDGE_SIZE = 720;
-
-type Side = "yours" | "pro";
-
-interface NudgeFrame {
-  canvas: HTMLCanvasElement;
-  pose: Pose | null;
-  timeSec: number;
-}
-interface SideWindow {
-  frames: NudgeFrame[];
-  center: number;
-}
-
 /**
- * Lazily decode a window of frames around the selected position so it can be
- * stepped through frame by frame, per side and on demand.
+ * Frame stepping around the selected position, per side and on demand.
  *
- * Nothing decodes until the first step for a side: viewing positions stays
- * instant. The window is dropped when the position changes, so memory is
- * bounded to the one position being examined (both sides), not all eight.
+ * Nothing decodes until the first step for a side, so viewing positions stays
+ * instant. The two pieces of state have deliberately different lifetimes:
+ *
+ *   - The decoded window is dropped when the position changes, so memory stays
+ *     bounded to the one position being examined rather than all eight. It is
+ *     re-decoded twice as wide when a step reaches its edge.
+ *   - The frame stepped to survives until the next analysis, because a nudge is
+ *     a correction rather than a peek. The offset stored alongside it is the
+ *     single source of truth for where each side sits, so a revisited position
+ *     picks up exactly where it was left.
  */
 function useNudge(results: Results | null, selected: EventName, model: ModelName) {
-  const [windows, setWindows] = useState<Record<Side, SideWindow | null>>({
+  const [windows, setWindows] = useState<Record<Side, NudgeWindow | null>>({
     yours: null,
     pro: null,
   });
-  const [offsets, setOffsets] = useState<Record<Side, number>>({ yours: 0, pro: 0 });
+  const [nudges, setNudges] = useState<NudgeStore>(emptyNudges);
   const [loading, setLoading] = useState<Record<Side, boolean>>({
     yours: false,
     pro: false,
   });
   const lmRef = useRef<ReturnType<typeof createLandmarker> | null>(null);
+  // Guards the decode against overlapping steps. A ref, not the `loading`
+  // state: disabling the buttons only takes effect on the next render, so taps
+  // landing in the gap (easy on a phone, and the natural way to walk several
+  // frames) would each start a full-clip decode. Concurrent decodes peg the
+  // main thread and race on setWindows, which can leave a stored offset
+  // pointing outside the window that finished last.
+  const decodingRef = useRef<Record<Side, boolean>>({ yours: false, pro: false });
 
   useEffect(() => {
     setWindows({ yours: null, pro: null });
-    setOffsets({ yours: 0, pro: 0 });
   }, [selected, results]);
+
+  useEffect(() => {
+    setNudges(emptyNudges());
+  }, [results]);
 
   const step = useCallback(
     async (side: Side, delta: number) => {
       const analysis = side === "yours" ? results?.yours : (results?.pro ?? null);
+      const clip = analysis?.clip;
+      if (!analysis || !clip || decodingRef.current[side]) return;
+
+      const offset = offsetOf(nudges[side], selected);
       let win = windows[side];
-      if (!win) {
-        if (!analysis?.clip || loading[side]) return;
+
+      // Decode on the first step for this side, and again at twice the width
+      // when a step reaches the edge, so a position that needs more than the
+      // initial window can still be walked all the way in.
+      if (!win || shouldWiden(win, offset, delta)) {
+        const half = win ? nextHalf(win) : halfFor(offset);
+        decodingRef.current[side] = true;
         setLoading((l) => ({ ...l, [side]: true }));
         try {
           const lm = await (lmRef.current ??= createLandmarker("IMAGE", { model }));
-          const { frames, centerIndex } = await analysis.clip.framesAround(
+          const { frames, centerIndex } = await clip.framesAround(
             analysis.eventTimes[selected],
-            NUDGE_HALF,
+            half,
             NUDGE_SIZE,
             analysis.rotation,
           );
-          win = {
+          // Posed here rather than on demand: the overlay needs it anyway, and
+          // it is what makes the stepped frame scorable for free.
+          const decoded: NudgeWindow = {
             frames: frames.map((f) => ({
               canvas: f.canvas,
               timeSec: f.timeSec,
               pose: firstPose(lm.detect(f.canvas), f.canvas.width, f.canvas.height),
             })),
             center: centerIndex,
+            half,
           };
-          setWindows((w) => ({ ...w, [side]: win }));
+          win = decoded;
+          setWindows((w) => ({ ...w, [side]: decoded }));
         } finally {
+          decodingRef.current[side] = false;
           setLoading((l) => ({ ...l, [side]: false }));
         }
       }
+
       const w = win;
       if (!w) return;
-      setOffsets((o) => {
-        const lo = -w.center;
-        const hi = w.frames.length - 1 - w.center;
-        return { ...o, [side]: Math.max(lo, Math.min(o[side] + delta, hi)) };
-      });
+      const next = clampOffset(w, offset + delta);
+      setNudges((n) => ({
+        ...n,
+        [side]: setNudge(n[side], selected, frameAt(w, next), next),
+      }));
     },
-    [results, selected, model, windows, loading],
+    [results, selected, model, windows, nudges],
   );
 
-  return { windows, offsets, loading, step };
+  return { windows, nudges, loading, step };
+}
+
+/** What a position currently shows: the frame stepped to, or the detected one. */
+function shownFrame(analysis: SwingAnalysis, map: NudgeMap, name: EventName) {
+  const nudge = map[name];
+  if (nudge) {
+    return {
+      tile: nudge.canvas,
+      pose: nudge.pose,
+      timeSec: nudge.timeSec,
+      offset: nudge.offset,
+    };
+  }
+  return {
+    tile: analysis.tiles[name],
+    pose: analysis.eventPoses[name],
+    timeSec: analysis.eventTimes[name],
+    offset: 0,
+  };
 }
 
 const ROTATIONS: Array<[Rotation, string]> = [
@@ -208,23 +264,49 @@ function ScoreBadge({ score, small }: { score: number; small?: boolean }) {
 }
 
 /**
+ * The score the detected frames gave, shown once a nudge has moved the live one.
+ *
+ * A nudged score is the user's judgement and two people will not reproduce it;
+ * the detected score is a function of the two clips alone. Keeping it on screen
+ * means the reproducible number is never lost behind the corrected one.
+ */
+function BaselineNote({ position }: { position: PositionSimilarity | null }) {
+  return (
+    <span className="baseline-note">
+      detected {position ? Math.round(position.score) : "n/a"}
+    </span>
+  );
+}
+
+/**
  * All 8 positions at a glance, the equivalent of the Python's contact sheet.
  * Tapping one opens it below at full size.
+ *
+ * Shows the frames in play, nudges included, and scores them: the sheet is the
+ * overview, so it would be misleading for it to keep showing a frame the user
+ * has already corrected.
  */
 function ContactSheet({
   results,
+  similarity,
+  nudges,
   selected,
   onSelect,
 }: {
   results: Results;
+  similarity: Similarity | null;
+  nudges: NudgeStore;
   selected: EventName;
   onSelect: (name: EventName) => void;
 }) {
-  const { yours, pro, similarity } = results;
+  const { yours, pro } = results;
   return (
     <div className="sheet">
       {EVENTS.map((name) => {
         const position = similarity?.[name] ?? null;
+        const yourShown = shownFrame(yours, nudges.yours, name);
+        const proShown = pro ? shownFrame(pro, nudges.pro, name) : null;
+        const nudged = yourShown.offset !== 0 || (proShown?.offset ?? 0) !== 0;
         return (
           <button
             key={name}
@@ -234,20 +316,20 @@ function ContactSheet({
             aria-pressed={name === selected}
           >
             <span className="cell-head">
-              <span className="cell-name">{label(name)}</span>
+              <span className="cell-name">
+                {label(name)}
+                {nudged && (
+                  <span className="cell-nudged" title="nudged off the detected frame">
+                    {" "}
+                    &bull;
+                  </span>
+                )}
+              </span>
               {position && <ScoreBadge score={position.score} small />}
             </span>
             <span className="cell-frames">
-              <FrameTile
-                tile={yours.tiles[name]}
-                pose={yours.eventPoses[name]}
-              />
-              {pro && (
-                <FrameTile
-                  tile={pro.tiles[name]}
-                  pose={pro.eventPoses[name]}
-                />
-              )}
+              <FrameTile tile={yourShown.tile} pose={yourShown.pose} />
+              {proShown && <FrameTile tile={proShown.tile} pose={proShown.pose} />}
             </span>
           </button>
         );
@@ -262,8 +344,8 @@ function SideFrame({
   analysis,
   name,
   crop,
+  nudges,
   window: win,
-  offset,
   loading,
   onStep,
 }: {
@@ -271,19 +353,17 @@ function SideFrame({
   analysis: SwingAnalysis;
   name: EventName;
   crop: CropRect | null;
-  window: SideWindow | null;
-  offset: number;
+  nudges: NudgeMap;
+  window: NudgeWindow | null;
   loading: boolean;
   onStep: (delta: number) => void;
 }) {
-  const idx = win ? win.center + offset : 0;
-  const current = win ? win.frames[idx] : null;
-  const tile = current ? current.canvas : analysis.tiles[name];
-  const pose = current ? current.pose : analysis.eventPoses[name];
-  const timeSec = current ? current.timeSec : analysis.eventTimes[name];
+  const { tile, pose, timeSec, offset } = shownFrame(analysis, nudges, name);
   const canStep = analysis.clip !== null;
-  const atStart = win ? idx <= 0 : false;
-  const atEnd = win ? idx >= win.frames.length - 1 : false;
+  // A button is dead only when it would change nothing: the window cannot reach
+  // further and widening it would not help, meaning the clip itself ran out.
+  const stuck = (delta: number) =>
+    !!win && !shouldWiden(win, offset, delta) && clampOffset(win, offset + delta) === offset;
 
   return (
     <div className="side">
@@ -299,7 +379,7 @@ function SideFrame({
             type="button"
             className="nudge-btn"
             aria-label="previous frame"
-            disabled={loading || atStart}
+            disabled={loading || stuck(-1)}
             onClick={() => onStep(-1)}
           >
             ‹
@@ -309,7 +389,7 @@ function SideFrame({
             type="button"
             className="nudge-btn"
             aria-label="next frame"
-            disabled={loading || atEnd}
+            disabled={loading || stuck(1)}
             onClick={() => onStep(1)}
           >
             ›
@@ -324,26 +404,35 @@ function SideFrame({
 function PositionDetail({
   name,
   results,
-  model,
+  similarity,
+  baseline,
+  nudge,
   onStep,
   align,
   onAlign,
 }: {
   name: EventName;
   results: Results;
-  model: ModelName;
+  /** Scores from the frames on screen, nudges included. */
+  similarity: Similarity | null;
+  /** Scores from the detected frames, kept visible as the reproducible number. */
+  baseline: Similarity | null;
+  nudge: ReturnType<typeof useNudge>;
   onStep: (delta: number) => void;
   align: boolean;
   onAlign: (value: boolean) => void;
 }) {
-  const { yours, pro, similarity } = results;
+  const { yours, pro } = results;
   const position = similarity?.[name] ?? null;
   const touch = useRef<{ x: number; y: number } | null>(null);
-  const { windows, offsets, loading, step } = useNudge(results, name, model);
+  const { windows, nudges, loading, step } = nudge;
+  const nudgedHere =
+    offsetOf(nudges.yours, name) !== 0 || offsetOf(nudges.pro, name) !== 0;
 
-  // One crop per video, anchored on the median across all 8 poses, so the
-  // view stays still while stepping and one bad pose cannot bend it. The
-  // window shape is resolved jointly so neither side needs letterboxing.
+  // One crop per video, anchored on the median across all 8 DETECTED poses, so
+  // the view stays still while stepping (a nudged pose must not move it) and
+  // one bad pose cannot bend it. The window shape is resolved jointly so
+  // neither side needs letterboxing.
   const [yoursCrop, proCrop] = useMemo<Array<CropRect | null>>(() => {
     if (!align) return [null, null];
     const sideFor = (analysis: SwingAnalysis) => {
@@ -388,6 +477,7 @@ function PositionDetail({
         <div className="detail-title">
           <h2>{label(name)}</h2>
           {position && <ScoreBadge score={position.score} />}
+          {nudgedHere && <BaselineNote position={baseline?.[name] ?? null} />}
           <span className="detail-count">
             {EVENTS.indexOf(name) + 1} / {EVENTS.length}
           </span>
@@ -408,8 +498,8 @@ function PositionDetail({
           analysis={yours}
           name={name}
           crop={yoursCrop}
+          nudges={nudges.yours}
           window={windows.yours}
-          offset={offsets.yours}
           loading={loading.yours}
           onStep={(d) => step("yours", d)}
         />
@@ -419,8 +509,8 @@ function PositionDetail({
             analysis={pro}
             name={name}
             crop={proCrop}
+            nudges={nudges.pro}
             window={windows.pro}
-            offset={offsets.pro}
             loading={loading.pro}
             onStep={(d) => step("pro", d)}
           />
@@ -609,7 +699,25 @@ export default function App() {
     }
   }, [yourFile, proFile, model]);
 
-  const overall = results?.similarity ? overallScore(results.similarity) : null;
+  const nudge = useNudge(results, selected, model);
+  const { nudges } = nudge;
+
+  // Scores from the frames actually on screen. results.similarity stays as the
+  // baseline: it comes from the detected frames, so it is the number two runs
+  // of the same two clips will always agree on.
+  const similarity = useMemo(() => {
+    if (!results?.pro) return null;
+    return compareEventPoses(
+      posesInPlay(results.yours.eventPoses, nudges.yours),
+      posesInPlay(results.pro.eventPoses, nudges.pro),
+    );
+  }, [results, nudges]);
+
+  const baseline = results?.similarity ?? null;
+  const overall = similarity ? overallScore(similarity) : null;
+  const baselineOverall = baseline ? overallScore(baseline) : null;
+  const showBaselineOverall =
+    anyNudged(nudges) && baselineOverall !== null && baselineOverall !== overall;
 
   return (
     <main>
@@ -694,12 +802,19 @@ export default function App() {
             <div className="overall">
               <span className="overall-label">Overall</span>
               <span className="overall-score">{Math.round(overall)}</span>
+              {showBaselineOverall && (
+                <span className="baseline-note">
+                  detected {Math.round(baselineOverall)}
+                </span>
+              )}
               <span className="overall-note">100 = identical joint angles</span>
             </div>
           )}
 
           <ContactSheet
             results={results}
+            similarity={similarity}
+            nudges={nudges}
             selected={selected}
             onSelect={(name) => {
               setSelected(name);
@@ -715,7 +830,9 @@ export default function App() {
             <PositionDetail
               name={selected}
               results={results}
-              model={model}
+              similarity={similarity}
+              baseline={baseline}
+              nudge={nudge}
               onStep={step}
               align={align}
               onAlign={setAlign}

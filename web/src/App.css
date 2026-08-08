@@ -142,6 +142,20 @@ button:disabled {
   opacity: 0.7;
 }
 
+/* The detected-frame score, kept beside a nudged one: quieter than the live
+   number, but never hidden, because it is the reproducible one. */
+.baseline-note {
+  font-size: 0.72rem;
+  opacity: 0.6;
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+}
+
+/* Marks a sheet cell whose frame has been stepped off the detected one. */
+.cell-nudged {
+  color: var(--accent);
+}
+
 /* All 8 positions at a glance, the way the Python's contact sheet reads. */
 .sheet {
   display: grid;
