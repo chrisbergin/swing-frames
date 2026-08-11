@@ -1126,8 +1126,10 @@ export default function App() {
             }}
           />
           <div className="sheet-actions">
+            {/* "Save comparison image" read as saving the single frame on
+                screen; naming the panel says it is all 8 positions at once. */}
             <button type="button" className="nudge-btn" onClick={saveComparison}>
-              Save comparison image
+              Save panel comparison
             </button>
             {saving && <span className="sheet-saving">{saving}</span>}
           </div>
