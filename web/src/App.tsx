@@ -22,7 +22,8 @@ import { analyzeSwing, compareAnalyses, type SwingAnalysis } from "./pipeline";
 import { loadSyncSequence, type SyncPair, type SyncSequence } from "./sync";
 import { createLandmarker, firstPose, type ModelName } from "./pose/landmarker";
 import { resolveCrops, videoAnchor, type CropRect } from "./ui/crop";
-import { drawPose } from "./ui/draw";
+import { drawFrame } from "./ui/frame";
+import { buildComparisonSheet, saveSheet } from "./ui/sheet";
 import {
   anyNudged,
   clampOffset,
@@ -140,6 +141,32 @@ function useNudge(results: Results | null, selected: EventName, model: ModelName
   return { windows, nudges, loading, step };
 }
 
+/**
+ * One crop per video, anchored on the median across all 8 DETECTED poses.
+ *
+ * Detected rather than nudged, deliberately: the view has to stay still while
+ * stepping, so a nudged pose must not move it, and the median stops one bad
+ * pose bending the crop. The window shape is resolved jointly across the clips
+ * so neither side needs letterboxing.
+ */
+function eventCrops(
+  yours: SwingAnalysis,
+  pro: SwingAnalysis | null,
+  align: boolean,
+): Array<CropRect | null> {
+  if (!align) return [null, null];
+  const sideFor = (analysis: SwingAnalysis) => {
+    const tile = EVENTS.map((n) => analysis.tiles[n]).find((t) => t !== null);
+    if (!tile) return { anchor: null, frameWidth: 0 };
+    const poses = EVENTS.map((n) => analysis.eventPoses[n]);
+    return { anchor: videoAnchor(poses, tile.height), frameWidth: tile.width };
+  };
+  const sides = [sideFor(yours)];
+  if (pro) sides.push(sideFor(pro));
+  const crops = resolveCrops(sides);
+  return [crops[0], crops[1] ?? null];
+}
+
 /** What a position currently shows: the frame stepped to, or the detected one. */
 function shownFrame(analysis: SwingAnalysis, map: NudgeMap, name: EventName) {
   const nudge = map[name];
@@ -181,9 +208,6 @@ const MODEL_LABELS: Record<ModelName, string> = {
 
 const label = (name: EventName) => name.replace(/_/g, " ");
 
-/** Rendered height of an aligned (cropped) tile, in canvas pixels. */
-const ALIGNED_TILE_HEIGHT = 720;
-
 /** One extracted frame with its skeleton drawn on, optionally cropped so the
  * golfer sits at a standard size and position. */
 function FrameTile({
@@ -201,51 +225,7 @@ function FrameTile({
 
   useEffect(() => {
     const canvas = ref.current;
-    if (!canvas || !tile) return;
-    const ctx0 = canvas.getContext("2d");
-    if (!ctx0) return;
-    const ctx = ctx0;
-
-    if (!crop) {
-      canvas.width = tile.width;
-      canvas.height = tile.height;
-      ctx.drawImage(tile, 0, 0);
-      // Poses are measured off the tile, so they are already in its coordinates.
-      if (pose) drawPose(ctx, pose, 1);
-      return;
-    }
-
-    const scale = ALIGNED_TILE_HEIGHT / crop.sh;
-    canvas.width = Math.round(crop.sw * scale);
-    canvas.height = ALIGNED_TILE_HEIGHT;
-    ctx.fillStyle = "#000";
-    ctx.fillRect(0, 0, canvas.width, canvas.height);
-
-    // The crop may reach past the frame; draw the part that exists and leave
-    // the overhang black, so the alignment never bends near an edge.
-    const ox = Math.max(crop.sx, 0);
-    const oy = Math.max(crop.sy, 0);
-    const ox2 = Math.min(crop.sx + crop.sw, tile.width);
-    const oy2 = Math.min(crop.sy + crop.sh, tile.height);
-    if (ox2 > ox && oy2 > oy) {
-      ctx.drawImage(
-        tile,
-        ox,
-        oy,
-        ox2 - ox,
-        oy2 - oy,
-        (ox - crop.sx) * scale,
-        (oy - crop.sy) * scale,
-        (ox2 - ox) * scale,
-        (oy2 - oy) * scale,
-      );
-    }
-    if (pose) {
-      ctx.save();
-      ctx.setTransform(scale, 0, 0, scale, -crop.sx * scale, -crop.sy * scale);
-      drawPose(ctx, pose, 1);
-      ctx.restore();
-    }
+    if (canvas) drawFrame(canvas, { tile, pose, crop });
   }, [tile, pose, crop]);
 
   return (
@@ -431,23 +411,10 @@ function PositionDetail({
   const nudgedHere =
     offsetOf(nudges.yours, name) !== 0 || offsetOf(nudges.pro, name) !== 0;
 
-  // One crop per video, anchored on the median across all 8 DETECTED poses, so
-  // the view stays still while stepping (a nudged pose must not move it) and
-  // one bad pose cannot bend it. The window shape is resolved jointly so
-  // neither side needs letterboxing.
-  const [yoursCrop, proCrop] = useMemo<Array<CropRect | null>>(() => {
-    if (!align) return [null, null];
-    const sideFor = (analysis: SwingAnalysis) => {
-      const tile = EVENTS.map((n) => analysis.tiles[n]).find((t) => t !== null);
-      if (!tile) return { anchor: null, frameWidth: 0 };
-      const poses = EVENTS.map((n) => analysis.eventPoses[n]);
-      return { anchor: videoAnchor(poses, tile.height), frameWidth: tile.width };
-    };
-    const sides = [sideFor(yours)];
-    if (pro) sides.push(sideFor(pro));
-    const crops = resolveCrops(sides);
-    return [crops[0], crops[1] ?? null];
-  }, [align, yours, pro]);
+  const [yoursCrop, proCrop] = useMemo(
+    () => eventCrops(yours, pro, align),
+    [align, yours, pro],
+  );
 
   return (
     <section
@@ -983,6 +950,48 @@ export default function App() {
   const showBaselineOverall =
     anyNudged(nudges) && baselineOverall !== null && baselineOverall !== overall;
 
+  // Saving the sheet: the frames in play (nudges included), cropped the way
+  // they are on screen, composited into one image. On a phone this opens the
+  // share sheet, which is the only reliable route into the camera roll.
+  const [saving, setSaving] = useState("");
+  const saveComparison = useCallback(async () => {
+    if (!results) return;
+    setSaving("Building the image…");
+    try {
+      const [yoursCrop, proCrop] = eventCrops(results.yours, results.pro, align);
+      const framesFor = (analysis: SwingAnalysis, map: NudgeMap, crop: CropRect | null) =>
+        Object.fromEntries(
+          EVENTS.map((name) => {
+            const shown = shownFrame(analysis, map, name);
+            return [name, { tile: shown.tile, pose: shown.pose, crop }];
+          }),
+        ) as Record<EventName, { tile: HTMLCanvasElement | null; pose: Pose | null; crop: CropRect | null }>;
+
+      const rows = [
+        { label: "you", frames: framesFor(results.yours, nudges.yours, yoursCrop) },
+      ];
+      if (results.pro) {
+        rows.push({
+          label: "reference",
+          frames: framesFor(results.pro, nudges.pro, proCrop),
+        });
+      }
+
+      const scores = Object.fromEntries(
+        EVENTS.map((name) => [name, similarity?.[name]?.score]).filter(
+          ([, v]) => v != null,
+        ),
+      ) as Partial<Record<EventName, number>>;
+
+      const outcome = await saveSheet(
+        buildComparisonSheet({ rows, scores, overall }),
+      );
+      setSaving(outcome === "shared" ? "" : "Saved to your downloads.");
+    } catch (err) {
+      setSaving(err instanceof Error ? err.message : String(err));
+    }
+  }, [results, align, nudges, similarity, overall]);
+
   return (
     <main>
       <header className="app-head">
@@ -1116,6 +1125,13 @@ export default function App() {
               });
             }}
           />
+          <div className="sheet-actions">
+            <button type="button" className="nudge-btn" onClick={saveComparison}>
+              Save comparison image
+            </button>
+            {saving && <span className="sheet-saving">{saving}</span>}
+          </div>
+
           <div ref={detailRef}>
             <PositionDetail
               name={selected}

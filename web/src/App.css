@@ -517,3 +517,17 @@ button:disabled {
   opacity: 0.7;
   margin: 0;
 }
+
+/* Save action under the contact sheet. */
+.sheet-actions {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  flex-wrap: wrap;
+  margin-bottom: 16px;
+}
+
+.sheet-saving {
+  font-size: 0.8rem;
+  opacity: 0.7;
+}
