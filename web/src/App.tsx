@@ -17,7 +17,9 @@ import {
   type Similarity,
 } from "./core/angles";
 import { EVENTS, type EventName, type Pose } from "./core/constants";
+import { anchorMarks, type Timing } from "./core/warp";
 import { analyzeSwing, compareAnalyses, type SwingAnalysis } from "./pipeline";
+import { loadSyncSequence, type SyncPair, type SyncSequence } from "./sync";
 import { createLandmarker, firstPose, type ModelName } from "./pose/landmarker";
 import { resolveCrops, videoAnchor, type CropRect } from "./ui/crop";
 import { drawPose } from "./ui/draw";
@@ -538,6 +540,266 @@ function PositionDetail({
   );
 }
 
+/**
+ * Similarity across the whole swing, drawn under the scrub.
+ *
+ * The 8 position scores say how much the two swings differ; this says WHERE in
+ * the motion it happens, which is the more useful answer. It costs nothing
+ * extra: the pairs are posed anyway to draw the skeletons, and a score is 9
+ * joint angles off those poses.
+ */
+function DivergenceCurve({
+  pairs,
+  marks,
+  phase,
+  onScrub,
+}: {
+  pairs: SyncPair[];
+  marks: Array<{ name: EventName; phase: number }>;
+  phase: number;
+  onScrub: (phase: number) => void;
+}) {
+  const W = 100;
+  const H = 34;
+  const y = (score: number) => H - (score / 100) * H;
+
+  // Break the line where a pose was missing rather than drawing through it.
+  const runs: string[] = [];
+  let current: string[] = [];
+  for (const p of pairs) {
+    if (p.similarity) {
+      current.push(`${(p.phase * W).toFixed(2)},${y(p.similarity.score).toFixed(2)}`);
+    } else if (current.length) {
+      runs.push(current.join(" "));
+      current = [];
+    }
+  }
+  if (current.length) runs.push(current.join(" "));
+
+  return (
+    <svg
+      className="curve"
+      viewBox={`0 0 ${W} ${H}`}
+      preserveAspectRatio="none"
+      role="img"
+      aria-label="similarity across the swing"
+      onClick={(e) => {
+        const box = e.currentTarget.getBoundingClientRect();
+        onScrub(Math.min(1, Math.max(0, (e.clientX - box.left) / box.width)));
+      }}
+    >
+      {marks.map((m) => (
+        <line
+          key={m.name}
+          className="curve-tick"
+          x1={m.phase * W}
+          x2={m.phase * W}
+          y1={0}
+          y2={H}
+        />
+      ))}
+      {runs.map((points, i) => (
+        <polyline key={i} className="curve-line" points={points} />
+      ))}
+      <line className="curve-head" x1={phase * W} x2={phase * W} y1={0} y2={H} />
+    </svg>
+  );
+}
+
+/**
+ * Both swings walked in step, driven by one scrub.
+ *
+ * The pairs are built once per timing mode and cached, so scrubbing and
+ * playback are pure state changes with no decoding in the loop. Playback is a
+ * timer over those cached frames, never video playback: this project already
+ * established that playing a clip is what makes a phone unusable.
+ */
+function SyncView({
+  results,
+  model,
+  align,
+  onAlign,
+}: {
+  results: Results;
+  model: ModelName;
+  align: boolean;
+  onAlign: (value: boolean) => void;
+}) {
+  const { yours, pro } = results;
+  // "equal" by default, which is not the obvious choice but is the right one.
+  // Under "yours" the scrub is proportional to real time, and a phone clip
+  // typically opens with the golfer stood still over the ball: IMG_5146 spends
+  // 1.9s of its 3.1s between address and toe up, so 60% of the scrub is a
+  // motionless frame. Equal per phase gives that hold one seventh instead.
+  const [timing, setTiming] = useState<Timing>("equal");
+  const [sequence, setSequence] = useState<SyncSequence | null>(null);
+  const [index, setIndex] = useState(0);
+  const [playing, setPlaying] = useState(false);
+  const [speed, setSpeed] = useState(0.25);
+  const [status, setStatus] = useState("");
+  const [error, setError] = useState("");
+
+  useEffect(() => {
+    if (!pro) return;
+    let cancelled = false;
+    const controller = new AbortController();
+    setSequence(null);
+    setError("");
+    setPlaying(false);
+    loadSyncSequence(yours, pro, {
+      timing,
+      model,
+      signal: controller.signal,
+      onProgress: (done, total) => {
+        if (!cancelled) setStatus(`Lining the swings up: ${done}/${total}`);
+      },
+    })
+      .then((seq) => {
+        if (cancelled) return;
+        setSequence(seq);
+        setIndex(0);
+      })
+      .catch((err) => {
+        if (!cancelled) setError(err instanceof Error ? err.message : String(err));
+      })
+      .finally(() => {
+        if (!cancelled) setStatus("");
+      });
+    return () => {
+      cancelled = true;
+      controller.abort();
+    };
+  }, [yours, pro, timing, model]);
+
+  // Playback walks the cached pairs on a timer. Under "yours" the master clip
+  // is linear in phase, so an even timer reproduces its real tempo scaled by
+  // the speed control.
+  useEffect(() => {
+    if (!playing || !sequence) return;
+    const steps = sequence.pairs.length - 1;
+    if (steps < 1) return;
+    const stepMs = (sequence.masterDurationSec * 1000) / steps / speed;
+    const id = setInterval(
+      () => setIndex((i) => Math.min(i + 1, steps)),
+      Math.max(16, stepMs),
+    );
+    return () => clearInterval(id);
+  }, [playing, sequence, speed]);
+
+  // Stopping at the end lives here rather than inside the index updater: an
+  // updater must be pure, and setting other state from within one leaves the
+  // timer firing against a value that never changes.
+  useEffect(() => {
+    if (playing && sequence && index >= sequence.pairs.length - 1) setPlaying(false);
+  }, [playing, sequence, index]);
+
+  if (!pro) return null;
+  if (error) return <p className="error">{error}</p>;
+  if (!sequence) return <p className="status">{status || "Lining the swings up…"}</p>;
+
+  const pair = sequence.pairs[Math.min(index, sequence.pairs.length - 1)];
+  const marks = anchorMarks(sequence.anchorPhases);
+  const scrubTo = (phase: number) => {
+    const steps = sequence.pairs.length - 1;
+    setIndex(Math.round(phase * steps));
+    setPlaying(false);
+  };
+  // The position whose anchor the playhead has most recently passed, so the
+  // scrub can say where in the swing you are without inventing new names.
+  const nearest = marks.reduce((best, m) =>
+    Math.abs(m.phase - pair.phase) < Math.abs(best.phase - pair.phase) ? m : best,
+  );
+
+  return (
+    <section className="sync">
+      <div className="frames">
+        <FrameTile
+          tile={pair.yours.canvas}
+          pose={pair.yours.pose}
+          crop={align ? sequence.yoursCrop : null}
+          caption={`you · ${pair.yours.timeSec.toFixed(2)}s`}
+        />
+        <FrameTile
+          tile={pair.pro.canvas}
+          pose={pair.pro.pose}
+          crop={align ? sequence.proCrop : null}
+          caption={`reference · ${pair.pro.timeSec.toFixed(2)}s`}
+        />
+      </div>
+
+      <div className="scrub">
+        <DivergenceCurve
+          pairs={sequence.pairs}
+          marks={marks}
+          phase={pair.phase}
+          onScrub={scrubTo}
+        />
+        <input
+          type="range"
+          min={0}
+          max={sequence.pairs.length - 1}
+          value={index}
+          aria-label="scrub through the swing"
+          onChange={(e) => {
+            setIndex(Number(e.target.value));
+            setPlaying(false);
+          }}
+        />
+        <div className="scrub-read">
+          <span className="scrub-where">{label(nearest.name)}</span>
+          {pair.similarity && <ScoreBadge score={pair.similarity.score} small />}
+        </div>
+      </div>
+
+      <div className="sync-controls">
+        <button
+          type="button"
+          className="nudge-btn"
+          onClick={() => {
+            if (index >= sequence.pairs.length - 1) setIndex(0);
+            setPlaying((p) => !p);
+          }}
+        >
+          {playing ? "Pause" : "Play"}
+        </button>
+        <label className="picker">
+          <span className="picker-label">Speed</span>
+          <select value={speed} onChange={(e) => setSpeed(Number(e.target.value))}>
+            <option value={0.15}>Very slow</option>
+            <option value={0.25}>Slow</option>
+            <option value={0.5}>Half speed</option>
+            <option value={1}>Real time</option>
+          </select>
+        </label>
+        <label className="picker">
+          <span className="picker-label">Timing</span>
+          <select value={timing} onChange={(e) => setTiming(e.target.value as Timing)}>
+            <option value="equal">Even per phase</option>
+            <option value="yours">Your tempo</option>
+          </select>
+        </label>
+      </div>
+
+      <label className="align-toggle">
+        <input
+          type="checkbox"
+          checked={align}
+          onChange={(e) => onAlign(e.target.checked)}
+        />
+        align golfers (crop both to the same body size, feet on the same line)
+      </label>
+
+      <p className="sync-note">
+        Both clips are held at the same moment of the swing, not the same clock
+        time, by mapping between the 8 detected positions.{" "}
+        {timing === "equal"
+          ? "Even per phase gives each segment the same share of the scrub: the downswing stretches out, and a long stand-still at address does not eat the whole bar."
+          : "Your tempo plays your swing at its real speed and bends the reference onto it. Expect a clip that opens with a long address hold to spend most of the scrub on it."}
+      </p>
+    </section>
+  );
+}
+
 function Diagnostics({
   label: text,
   analysis,
@@ -618,6 +880,7 @@ export default function App() {
   const [error, setError] = useState("");
   const [results, setResults] = useState<Results | null>(null);
   const [selected, setSelected] = useState<EventName>("address");
+  const [mode, setMode] = useState<"frames" | "sync">("frames");
   const [align, setAlign] = useState(true);
   const detailRef = useRef<HTMLDivElement>(null);
   const resultsRef = useRef<HTMLDivElement>(null);
@@ -637,16 +900,17 @@ export default function App() {
     );
   }, []);
 
-  // Desktop nicety: arrow keys step through the positions too.
+  // Desktop nicety: arrow keys step through the positions too. Not in sync
+  // mode, where the arrows belong to the scrub slider.
   useEffect(() => {
-    if (!results) return;
+    if (!results || mode !== "frames") return;
     const onKey = (e: KeyboardEvent) => {
       if (e.key === "ArrowLeft") step(-1);
       if (e.key === "ArrowRight") step(1);
     };
     window.addEventListener("keydown", onKey);
     return () => window.removeEventListener("keydown", onKey);
-  }, [results, step]);
+  }, [results, step, mode]);
 
   const run = useCallback(async () => {
     if (!yourFile) return;
@@ -811,6 +1075,32 @@ export default function App() {
             </div>
           )}
 
+          {results.pro && (
+            <div className="modes" role="tablist">
+              {(["frames", "sync"] as const).map((m) => (
+                <button
+                  key={m}
+                  type="button"
+                  role="tab"
+                  aria-selected={mode === m}
+                  className={`mode${mode === m ? " is-on" : ""}`}
+                  onClick={() => setMode(m)}
+                >
+                  {m === "frames" ? "Frames" : "Sync"}
+                </button>
+              ))}
+            </div>
+          )}
+
+          {mode === "sync" && results.pro ? (
+            <SyncView
+              results={results}
+              model={model}
+              align={align}
+              onAlign={setAlign}
+            />
+          ) : (
+          <>
           <ContactSheet
             results={results}
             similarity={similarity}
@@ -838,6 +1128,8 @@ export default function App() {
               onAlign={setAlign}
             />
           </div>
+          </>
+          )}
 
           <details className="diagnostics">
             <summary>Diagnostics</summary>

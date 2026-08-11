@@ -123,34 +123,41 @@ export function compareEventPoses(
   posesB: Record<EventName, Pose | null>,
 ): Similarity {
   const result = {} as Similarity;
-
   for (const name of EVENTS) {
-    const pa = posesA[name];
-    const pb = posesB[name];
-    if (!pa || !pb) {
-      result[name] = null;
-      continue;
-    }
-
-    const aa = jointAngles(pa);
-    const ab = jointAngles(pb);
-    const diffs = {} as Record<AngleName, number>;
-    let total = 0;
-    for (const k of ANGLE_NAMES) {
-      const d = Math.abs(aa[k] - ab[k]);
-      diffs[k] = round1(d);
-      total += d;
-    }
-    const meanDiff = total / ANGLE_NAMES.length;
-
-    result[name] = {
-      score: round1(Math.max(0, 100 - 2 * meanDiff)),
-      meanAngleDiffDeg: round1(meanDiff),
-      jointDiffsDeg: diffs,
-    };
+    result[name] = comparePoses(posesA[name], posesB[name]);
   }
-
   return result;
+}
+
+/**
+ * Similarity between one pair of poses, or null if either is missing.
+ *
+ * The unit both the per-position scores and the sync view's divergence curve
+ * are built from: the curve scores a pair at every sampled phase point, which
+ * is the same measurement applied at moments that are not named positions.
+ */
+export function comparePoses(
+  pa: Pose | null,
+  pb: Pose | null,
+): PositionSimilarity | null {
+  if (!pa || !pb) return null;
+
+  const aa = jointAngles(pa);
+  const ab = jointAngles(pb);
+  const diffs = {} as Record<AngleName, number>;
+  let total = 0;
+  for (const k of ANGLE_NAMES) {
+    const d = Math.abs(aa[k] - ab[k]);
+    diffs[k] = round1(d);
+    total += d;
+  }
+  const meanDiff = total / ANGLE_NAMES.length;
+
+  return {
+    score: round1(Math.max(0, 100 - 2 * meanDiff)),
+    meanAngleDiffDeg: round1(meanDiff),
+    jointDiffsDeg: diffs,
+  };
 }
 
 /** Mean score across the positions that could be scored, or null if none could. */
