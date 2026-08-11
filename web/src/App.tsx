@@ -1095,7 +1095,7 @@ export default function App() {
                   className={`mode${mode === m ? " is-on" : ""}`}
                   onClick={() => setMode(m)}
                 >
-                  {m === "frames" ? "Frames" : "Sync"}
+                  {m === "frames" ? "Frames" : "Full playback"}
                 </button>
               ))}
             </div>
