@@ -25,7 +25,7 @@ export function drawPose(
   const unit = Math.max(1, ctx.canvas.width / 360);
 
   ctx.save();
-  ctx.lineWidth = 2 * unit;
+  ctx.lineWidth = 1 * unit;
   ctx.strokeStyle = LIMB_COLOR;
   ctx.lineCap = "round";
   ctx.beginPath();
@@ -38,7 +38,7 @@ export function drawPose(
   ctx.fillStyle = JOINT_COLOR;
   for (let i = FIRST_BODY_LANDMARK; i < pose.length; i++) {
     ctx.beginPath();
-    ctx.arc(x(i), y(i), 4 * unit, 0, Math.PI * 2);
+    ctx.arc(x(i), y(i), 2 * unit, 0, Math.PI * 2);
     ctx.fill();
   }
   ctx.restore();
